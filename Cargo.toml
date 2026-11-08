@@ -1,0 +1,68 @@
+[package]
+name = "mcpaw"
+version = "0.1.0"
+edition = "2021"
+description = "MCP and Agent Workbench: local proxy, flight recorder, and modular analysis shell for MCP servers and LLM APIs"
+license = "Apache-2.0"
+default-run = "wb"
+
+[lib]
+name = "mcpaw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wb"
+path = "src/bin/wb.rs"
+
+[[bin]]
+name = "wbd"
+path = "src/bin/wbd.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-stream = "0.3"
+axum = { version = "=0.7.9", features = ["macros", "json"] }
+bytes = "=1.9.0"
+chrono = { version = "=0.4.39", features = ["serde"] }
+clap = { version = "=4.5.20", features = ["derive", "env"] }
+clap_lex = "=0.7.2"
+futures = "0.3"
+hex = "0.4"
+http = "=1.2.0"
+rand = "=0.8.5"
+regex = "=1.11.1"
+reqwest = { version = "=0.12.9", default-features = false, features = ["json", "stream", "default-tls"] }
+rusqlite = { version = "=0.32.1", features = ["bundled"] }
+serde = { version = "=1.0.217", features = ["derive"] }
+serde_json = "=1.0.135"
+sha2 = "=0.10.8"
+thiserror = "=1.0.69"
+tokio = { version = "=1.42.0", features = ["full"] }
+tokio-stream = { version = "=0.1.17", features = ["sync"] }
+tokio-util = "=0.7.13"
+toml = "=0.8.19"
+toml_edit = "=0.22.22"
+toml_datetime = "=0.6.8"
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
+uuid = { version = "=1.11.0", features = ["v4", "serde"] }
+zstd = "=0.13.2"
+
+# Transitive pins for Rust 1.84 compatibility
+hashbrown = "=0.15.2"
+indexmap = "=2.7.0"
+jobserver = "=0.1.32"
+zeroize = "=1.8.1"
+idna = "=1.0.3"
+idna_adapter = "=1.2.0"
+hyper-util = "=0.1.10"
+cpufeatures = "=0.2.16"
+security-framework = "=2.11.1"
+native-tls = "=0.2.12"
+backtrace = "=0.3.74"
+addr2line = "=0.24.2"
+gimli = "=0.31.1"
+object = "=0.36.5"
+
+[dev-dependencies]
+tempfile = "=3.14.0"

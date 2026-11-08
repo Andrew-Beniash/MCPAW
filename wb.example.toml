@@ -1,0 +1,54 @@
+# MCP and Agent Workbench Example Configuration
+# Copy to ~/.config/workbench/wb.toml
+
+[daemon]
+mcp_port          = 7410
+ui_port           = 7411
+bind              = "127.0.0.1"
+idle_run_gap_secs = 30
+
+[capture]
+payloads           = "metadata"     # "off" | "metadata" | "full"
+redact             = [
+  "authorization",
+  "api[_-]?key",
+  "bearer\\s+\\S+",
+  "sk-[A-Za-z0-9_-]{12,}"
+]
+retention_days     = 14
+max_db_mb          = 2048
+inject_traceparent = false
+
+[[server]]
+id        = "invoices"
+transport = "stdio"                 # registered by `wb wrap --id invoices`
+
+[[server]]
+id        = "jira"
+transport = "http"
+upstream  = "https://mcp.internal.example.com/jira"
+
+[pricing]
+source = "bundled"                  # bundled table, overridable per model
+
+[breaker]
+enabled                  = true
+max_run_cost_usd         = 5.0
+max_run_tokens           = 500000
+max_identical_tool_calls = 5
+
+[policy]
+enabled                = false
+fail_closed            = true
+block_on_schema_change = false
+
+[[policy.rules]]
+id          = "deny-outside-workspace"
+server      = "filesystem"
+tool        = "write_file"
+arg_pattern = "^(?!.*\"/workspace/).*"
+effect      = "deny"
+reason      = "Filesystem writes outside /workspace are prohibited"
+
+[export]
+otlp_endpoint = ""                  # empty = disabled
