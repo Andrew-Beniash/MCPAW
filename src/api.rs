@@ -61,7 +61,10 @@ pub fn build_api_router(state: ApiState) -> Router {
         .route("/status", get(get_status))
         .route("/servers", get(list_servers))
         .route("/servers/:id/tools", get(get_server_tools))
-        .route("/servers/:id/schema-history", get(get_server_schema_history))
+        .route(
+            "/servers/:id/schema-history",
+            get(get_server_schema_history),
+        )
         .route("/servers/:id/call", post(manual_tool_call))
         .route("/runs", get(list_runs))
         .route("/runs/diff", get(diff_runs))
@@ -149,11 +152,7 @@ fn is_allowed_loopback_host(host_with_port: &str) -> bool {
             .map(|s| format!("{}]", s))
             .unwrap_or(trimmed)
     } else {
-        trimmed
-            .split(':')
-            .next()
-            .unwrap_or(&trimmed)
-            .to_string()
+        trimmed.split(':').next().unwrap_or(&trimmed).to_string()
     };
     matches!(host_only.as_str(), "127.0.0.1" | "localhost" | "[::1]")
 }
@@ -174,11 +173,7 @@ fn is_allowed_loopback_origin(origin: &str) -> bool {
 }
 
 /// Enforces §8 UI Token requirement on `/api/*` endpoints.
-async fn require_ui_token(
-    State(state): State<ApiState>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn require_ui_token(State(state): State<ApiState>, req: Request, next: Next) -> Response {
     let headers = req.headers();
     let expected = &state.ui_token;
 
@@ -661,10 +656,7 @@ async fn list_runs(
     }
 }
 
-async fn get_run(
-    State(state): State<ApiState>,
-    AxumPath(run_id): AxumPath<String>,
-) -> Response {
+async fn get_run(State(state): State<ApiState>, AxumPath(run_id): AxumPath<String>) -> Response {
     state.bus.flush().await;
     match state.bus.store.get_run(&run_id) {
         Ok(Some(run)) => Json(run).into_response(),
@@ -827,35 +819,34 @@ pub struct ExportResponse {
     pub content: String,
 }
 
-async fn export_runs(
-    State(state): State<ApiState>,
-    Json(req): Json<ExportRequest>,
-) -> Response {
+async fn export_runs(State(state): State<ApiState>, Json(req): Json<ExportRequest>) -> Response {
     state.bus.flush().await;
     let fmt = req.format.to_lowercase();
     // M14: Reject unknown export formats instead of silently falling back to jsonl
-    let content_res = match fmt.as_str() {
-        "otlp" => state
-            .bus
-            .store
-            .export_otlp(&req.run_ids)
+    if !matches!(fmt.as_str(), "otlp" | "mockmcp" | "jsonl") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Unsupported export format '{}'. Valid formats: jsonl, otlp, mockmcp", fmt)
+            })),
+        )
+            .into_response();
+    }
+    // N9: exports can be large; run the blocking SQLite read off the async workers.
+    let store = state.bus.store.clone();
+    let run_ids = req.run_ids.clone();
+    let fmt_for_task = fmt.clone();
+    let content_res = tokio::task::spawn_blocking(move || match fmt_for_task.as_str() {
+        "otlp" => store
+            .export_otlp(&run_ids)
             .and_then(|v| Ok(serde_json::to_string_pretty(&v)?)),
-        "mockmcp" => state
-            .bus
-            .store
-            .export_mockmcp(&req.run_ids)
+        "mockmcp" => store
+            .export_mockmcp(&run_ids)
             .and_then(|v| Ok(serde_json::to_string_pretty(&v)?)),
-        "jsonl" => state.bus.store.export_jsonl(&req.run_ids),
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": format!("Unsupported export format '{}'. Valid formats: jsonl, otlp, mockmcp", other)
-                })),
-            )
-                .into_response();
-        }
-    };
+        _ => store.export_jsonl(&run_ids),
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("export task failed: {}", e)));
 
     match content_res {
         Ok(raw_content) => {
@@ -895,10 +886,7 @@ struct ImportRequest {
     pub jsonl: String,
 }
 
-async fn import_runs(
-    State(state): State<ApiState>,
-    Json(req): Json<ImportRequest>,
-) -> Response {
+async fn import_runs(State(state): State<ApiState>, Json(req): Json<ImportRequest>) -> Response {
     match state.bus.store.import_jsonl(&req.jsonl) {
         Ok(count) => Json(json!({ "imported_runs": count })).into_response(),
         Err(e) => (
@@ -958,12 +946,37 @@ async fn update_policies(
         }
     }
 
+    // N7: Persist first, then apply, so a failed save never leaves the daemon enforcing rules that
+    // are not on disk.
+    let (new_policy, persisted) = {
+        let mut cfg = state.config.lock().unwrap();
+        let mut candidate = cfg.policy.clone();
+        candidate.enabled = req.enabled;
+        if let Some(b) = req.block_on_schema_change {
+            candidate.block_on_schema_change = b;
+        }
+        candidate.rules = req.rules.clone();
+        match cfg.save_policy_atomic(&candidate) {
+            Ok(persisted) => {
+                cfg.policy = candidate.clone();
+                (candidate, persisted)
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to save wb.toml; policy not changed: {}", e) })),
+                )
+                    .into_response();
+            }
+        }
+    };
     {
         let mut mods = state.bus.modules.lock().unwrap();
-        if let Some(b) = req.block_on_schema_change {
-            mods.policy.config.block_on_schema_change = b;
-        }
-        if let Err(e) = mods.policy.update_rules(req.enabled, req.rules.clone()) {
+        mods.policy.config.block_on_schema_change = new_policy.block_on_schema_change;
+        if let Err(e) = mods
+            .policy
+            .update_rules(new_policy.enabled, new_policy.rules.clone())
+        {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": e.to_string() })),
@@ -971,24 +984,7 @@ async fn update_policies(
                 .into_response();
         }
     }
-    let save_res = {
-        let mut cfg = state.config.lock().unwrap();
-        cfg.policy.enabled = req.enabled;
-        if let Some(b) = req.block_on_schema_change {
-            cfg.policy.block_on_schema_change = b;
-        }
-        cfg.policy.rules = req.rules;
-        // H3: Persist policy edits atomically to wb.toml
-        cfg.save_atomic()
-    };
-    if let Err(e) = save_res {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Updated in memory, but failed to save wb.toml: {}", e) })),
-        )
-            .into_response();
-    }
-    Json(json!({ "status": "updated" })).into_response()
+    Json(json!({ "status": "updated", "persisted": persisted })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1009,13 +1005,8 @@ async fn test_policy(
     };
     let (verdict, decision) = {
         let mods = state.bus.modules.lock().unwrap();
-        mods.policy.evaluate_call(
-            "policy-test",
-            &req.server,
-            &req.tool,
-            &args_str,
-            now_ns(),
-        )
+        mods.policy
+            .evaluate_call("policy-test", &req.server, &req.tool, &args_str, now_ns())
     };
     Json(json!({
         "allowed": !verdict.is_blocked(),
@@ -1025,10 +1016,7 @@ async fn test_policy(
     .into_response()
 }
 
-async fn ingest_otel(
-    State(state): State<ApiState>,
-    Json(payload): Json<Value>,
-) -> Response {
+async fn ingest_otel(State(state): State<ApiState>, Json(payload): Json<Value>) -> Response {
     match state.bus.store.ingest_otel_spans(&payload) {
         Ok(ingested) => Json(json!({ "ingested_spans": ingested })).into_response(),
         Err(e) => (

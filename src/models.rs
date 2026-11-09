@@ -331,6 +331,7 @@ impl Verdict {
 /// Event flowing through the Workbench in-process bounded Event Bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum WorkbenchEvent {
     SessionStarted {
         session: Session,

@@ -130,9 +130,7 @@ impl Redactor {
     pub fn sanitize_event(&self, event: &mut WorkbenchEvent) {
         match event {
             WorkbenchEvent::SessionStarted { .. } => {}
-            WorkbenchEvent::ServerObserved {
-                command_or_url, ..
-            } => {
+            WorkbenchEvent::ServerObserved { command_or_url, .. } => {
                 *command_or_url = self.redact_str(command_or_url);
             }
             WorkbenchEvent::ToolsDiscovered { tools, .. } => {
@@ -166,7 +164,7 @@ impl Redactor {
                     CaptureLevel::Metadata => {
                         span.attributes.remove(semconv::GEN_AI_TOOL_CALL_ARGUMENTS);
                         span.attributes.remove(semconv::GEN_AI_TOOL_CALL_RESULT);
-                        for (_, v) in span.attributes.iter_mut() {
+                        for v in span.attributes.values_mut() {
                             self.redact_json_value(v);
                         }
                         for msg in mcp_messages.iter_mut() {
@@ -178,7 +176,7 @@ impl Redactor {
                         }
                     }
                     CaptureLevel::Full => {
-                        for (_, v) in span.attributes.iter_mut() {
+                        for v in span.attributes.values_mut() {
                             self.redact_json_value(v);
                         }
                         for msg in mcp_messages.iter_mut() {
@@ -204,38 +202,36 @@ impl Redactor {
                 attributes_patch,
                 response_message,
                 ..
-            } => {
-                match self.capture_level {
-                    CaptureLevel::Off => {
-                        attributes_patch.clear();
-                        if let Some(msg) = response_message.as_mut() {
-                            msg.payload = None;
-                            msg.method = None;
-                            msg.jsonrpc_id = None;
-                        }
+            } => match self.capture_level {
+                CaptureLevel::Off => {
+                    attributes_patch.clear();
+                    if let Some(msg) = response_message.as_mut() {
+                        msg.payload = None;
+                        msg.method = None;
+                        msg.jsonrpc_id = None;
                     }
-                    CaptureLevel::Metadata => {
-                        attributes_patch.remove(semconv::GEN_AI_TOOL_CALL_ARGUMENTS);
-                        attributes_patch.remove(semconv::GEN_AI_TOOL_CALL_RESULT);
-                        for (_, v) in attributes_patch.iter_mut() {
-                            self.redact_json_value(v);
-                        }
-                        if let Some(msg) = response_message.as_mut() {
-                            msg.payload = None;
-                        }
+                }
+                CaptureLevel::Metadata => {
+                    attributes_patch.remove(semconv::GEN_AI_TOOL_CALL_ARGUMENTS);
+                    attributes_patch.remove(semconv::GEN_AI_TOOL_CALL_RESULT);
+                    for v in attributes_patch.values_mut() {
+                        self.redact_json_value(v);
                     }
-                    CaptureLevel::Full => {
-                        for (_, v) in attributes_patch.iter_mut() {
-                            self.redact_json_value(v);
-                        }
-                        if let Some(msg) = response_message.as_mut() {
-                            if let Some(ref p) = msg.payload {
-                                msg.payload = Some(self.redact_payload_str(p));
-                            }
+                    if let Some(msg) = response_message.as_mut() {
+                        msg.payload = None;
+                    }
+                }
+                CaptureLevel::Full => {
+                    for v in attributes_patch.values_mut() {
+                        self.redact_json_value(v);
+                    }
+                    if let Some(msg) = response_message.as_mut() {
+                        if let Some(ref p) = msg.payload {
+                            msg.payload = Some(self.redact_payload_str(p));
                         }
                     }
                 }
-            }
+            },
             WorkbenchEvent::PolicyEvaluated { decision } => {
                 decision.reason = self.redact_str(&decision.reason);
             }

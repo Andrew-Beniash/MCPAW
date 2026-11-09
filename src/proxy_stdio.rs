@@ -32,8 +32,12 @@ pub async fn start_ipc_listener(socket_path: PathBuf, bus: EventBus) -> Result<(
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("Failed to bind Unix IPC socket at {}", socket_path.display()))?;
+    let listener = UnixListener::bind(&socket_path).with_context(|| {
+        format!(
+            "Failed to bind Unix IPC socket at {}",
+            socket_path.display()
+        )
+    })?;
 
     {
         use std::os::unix::fs::PermissionsExt;
@@ -120,6 +124,63 @@ async fn handle_ipc_connection(stream: UnixStream, bus: EventBus) -> Result<()> 
     Ok(())
 }
 
+/// Client-facing stdout shared by the forwarding and policy tasks (N5). Writes are serialized by
+/// `Stdout`'s own lock, so a policy error line can never interleave with a server chunk.
+#[derive(Clone)]
+struct ClientStdout;
+
+impl ClientStdout {
+    fn new() -> Self {
+        ClientStdout
+    }
+
+    fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let write = || {
+            use std::io::Write as _;
+            let mut out = std::io::stdout().lock();
+            out.write_all(bytes)?;
+            out.flush()
+        };
+        match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(write),
+            _ => write(),
+        }
+    }
+}
+
+/// Builds the JSON-RPC reply for a policy-blocked line (N4). A single request gets one error
+/// object; a batch is rejected as a whole with an array holding one error entry per request id.
+fn build_block_reply(line: &str, denied_id: &Value, reason: &str) -> Value {
+    let err = |id: &Value, msg: String| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32001, "message": msg }
+        })
+    };
+    let denied_msg = format!("MCP Workbench Policy Block: {}", reason);
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(line.trim()) {
+        let entries: Vec<Value> = items
+            .iter()
+            .filter(|it| it.get("method").is_some())
+            .filter_map(|it| it.get("id"))
+            .map(|id| {
+                if id == denied_id {
+                    err(id, denied_msg.clone())
+                } else {
+                    err(
+                        id,
+                        "MCP Workbench Policy Block: batch rejected because another request in it was denied"
+                            .to_string(),
+                    )
+                }
+            })
+            .collect();
+        return Value::Array(entries);
+    }
+    err(denied_id, denied_msg)
+}
+
 #[derive(Debug, Clone)]
 struct PendingRequest {
     span_id: String,
@@ -156,7 +217,17 @@ pub async fn run_stdio_wrapper(
     socket_path: PathBuf,
     mut policy_enforced: bool,
     run_id_override: Option<String>,
+    config_error: Option<String>,
 ) -> Result<i32> {
+    // N6: Policy enforcement needs the Unix-socket IPC to `wbd`; refuse rather than block every call.
+    #[cfg(not(unix))]
+    if policy_enforced {
+        anyhow::bail!(
+            "policy enforcement requires Unix sockets and is not supported on this platform yet; \
+             run `wb wrap` without --policy and disable [policy] enabled"
+        );
+    }
+
     let session_id = format!("sess-{}", Uuid::new_v4());
     let run_id = run_id_override.unwrap_or_else(|| "auto".to_string());
     let full_cmd = if args.is_empty() {
@@ -169,7 +240,23 @@ pub async fn run_stdio_wrapper(
     command_argv.extend(args.iter().cloned());
 
     // H3: If policy wasn't explicitly passed on CLI, query daemon if reachable to see if policy was enabled dynamically
-    if !policy_enforced {
+    // N2: A config that failed to load must never silently disable the firewall. If the daemon is
+    // reachable it is the source of truth; otherwise fail closed on `tools/call` (traffic still flows).
+    let mut local_block_reason: Option<String> = None;
+    if let Some(err) = config_error {
+        match query_daemon_policy_mode(&socket_path).await {
+            Some(daemon_pol) => {
+                policy_enforced = policy_enforced || daemon_pol;
+            }
+            None => {
+                policy_enforced = true;
+                local_block_reason = Some(format!(
+                    "wb configuration is invalid and the Workbench daemon is unreachable, so policy \
+                     cannot be evaluated (fail-closed): {err}"
+                ));
+            }
+        }
+    } else if !policy_enforced {
         if let Some(daemon_pol) = query_daemon_policy_mode(&socket_path).await {
             policy_enforced = daemon_pol;
         }
@@ -333,22 +420,15 @@ pub async fn run_stdio_wrapper(
     });
 
     // M3: Single async writer task for client stdout so slow client reads never block worker threads
-    let (stdout_tx, mut stdout_rx) = mpsc::channel::<Vec<u8>>(1024);
-    let stdout_writer_task = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        while let Some(bytes) = stdout_rx.recv().await {
-            if stdout.write_all(&bytes).await.is_err() {
-                break;
-            }
-            if stdout.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    // N5: Server output is written straight to the process stdout from the forwarding task.
+    // `tokio::io::stdout()` hands every write and flush to the blocking pool (two thread hops per
+    // chunk), which cost ~1 ms at p99. A direct std write inside `block_in_place` has no hop, and
+    // still tells the runtime this worker may block (M3), so a slow client never stalls other tasks.
+    let shared_stdout = ClientStdout::new();
 
     // Task 1: Forward stdin -> child_stdin
     let obs_tx_stdin = obs_tx.clone();
-    let stdout_for_policy = stdout_tx.clone();
+    let stdout_for_policy = shared_stdout.clone();
     let sock_for_policy = socket_path.clone();
     let server_for_policy = server_id.clone();
     let session_for_policy = session_id.clone();
@@ -359,10 +439,7 @@ pub async fn run_stdio_wrapper(
         let mut buf = vec![0u8; 65536];
         let mut line_acc: Vec<u8> = Vec::with_capacity(4096);
 
-        loop {
-            let Ok(n) = stdin.read(&mut buf).await else {
-                break;
-            };
+        while let Ok(n) = stdin.read(&mut buf).await {
             if n == 0 {
                 if policy_enforced && !line_acc.is_empty() {
                     let _ = child_stdin.write_all(&line_acc).await;
@@ -406,6 +483,10 @@ pub async fn run_stdio_wrapper(
                     let mut blocked_error: Option<(Value, String)> = None;
 
                     for (req_id_val, tool_name, args_raw) in &tool_calls {
+                        if let Some(ref why) = local_block_reason {
+                            blocked_error = Some((req_id_val.clone(), why.clone()));
+                            break;
+                        }
                         let check_res = check_policy_over_ipc(
                             &sock_for_policy,
                             &session_for_policy,
@@ -428,21 +509,15 @@ pub async fn run_stdio_wrapper(
                     }
 
                     if let Some((req_id_val, reason)) = blocked_error {
-                        let err_json = json!({
-                            "jsonrpc": "2.0",
-                            "id": req_id_val,
-                            "error": {
-                                "code": -32001,
-                                "message": format!("MCP Workbench Policy Block: {}", reason)
-                            }
-                        });
+                        // N4: JSON-RPC 2.0 requires an array reply with one entry per request of a batch.
+                        let err_json = build_block_reply(&line_str, &req_id_val, &reason);
                         let mut err_line = serde_json::to_string(&err_json).unwrap_or_default();
                         if raw_line.ends_with(b"\r\n") {
                             err_line.push_str("\r\n");
                         } else {
                             err_line.push('\n');
                         }
-                        let _ = stdout_for_policy.send(err_line.into_bytes()).await;
+                        let _ = stdout_for_policy.write_all(err_line.as_bytes());
                         continue;
                     }
 
@@ -464,15 +539,12 @@ pub async fn run_stdio_wrapper(
 
     // Task 2: Forward child_stdout -> stdout byte-for-byte via async stdout channel
     let obs_tx_stdout = obs_tx.clone();
-    let stdout_for_child = stdout_tx.clone();
+    let stdout_for_child = shared_stdout.clone();
     let stdout_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         let mut line_acc: Vec<u8> = Vec::with_capacity(4096);
 
-        loop {
-            let Ok(n) = child_stdout.read(&mut buf).await else {
-                break;
-            };
+        while let Ok(n) = child_stdout.read(&mut buf).await {
             if n == 0 {
                 if !line_acc.is_empty() {
                     let byte_len = line_acc.len();
@@ -487,7 +559,7 @@ pub async fn run_stdio_wrapper(
                 break;
             }
             let chunk = &buf[..n];
-            if stdout_for_child.send(chunk.to_vec()).await.is_err() {
+            if stdout_for_child.write_all(chunk).is_err() {
                 break;
             }
 
@@ -509,10 +581,7 @@ pub async fn run_stdio_wrapper(
     let stderr_task = tokio::spawn(async move {
         let mut stderr = tokio::io::stderr();
         let mut buf = vec![0u8; 16384];
-        loop {
-            let Ok(n) = child_stderr.read(&mut buf).await else {
-                break;
-            };
+        while let Ok(n) = child_stderr.read(&mut buf).await {
             if n == 0 {
                 break;
             }
@@ -527,8 +596,6 @@ pub async fn run_stdio_wrapper(
     let _ = stdout_task.await;
     let _ = stderr_task.await;
     stdin_task.abort();
-    drop(stdout_tx);
-    let _ = stdout_writer_task.await;
     drop(obs_tx);
 
     let _ = tokio::time::timeout(Duration::from_millis(250), obs_handle).await;
@@ -577,7 +644,8 @@ async fn check_policy_over_ipc(
     #[cfg(unix)]
     {
         let Ok(Ok(stream)) =
-            tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(socket_path)).await
+            tokio::time::timeout(Duration::from_millis(500), UnixStream::connect(socket_path))
+                .await
         else {
             return IpcResponse {
                 allowed: false,
@@ -643,7 +711,9 @@ async fn check_policy_over_ipc(
 
     IpcResponse {
         allowed: false,
-        reason: Some("Policy IPC read timed out or daemon closed connection (fail-closed)".to_string()),
+        reason: Some(
+            "Policy IPC read timed out or daemon closed connection (fail-closed)".to_string(),
+        ),
         rule_id: Some("fail-closed".to_string()),
         policy_enabled: true,
     }
@@ -672,7 +742,12 @@ async fn send_ipc_observe(
 }
 
 #[cfg(not(unix))]
-async fn send_ipc_observe(_stream_opt: &mut Option<()>, _socket_path: &Path, _event: WorkbenchEvent) {}
+async fn send_ipc_observe(
+    _stream_opt: &mut Option<()>,
+    _socket_path: &Path,
+    _event: WorkbenchEvent,
+) {
+}
 
 #[cfg(unix)]
 type IpcStreamOpt = Option<UnixStream>;
@@ -798,7 +873,10 @@ async fn process_client_frame(
                 attrs.insert(semconv::WB_POLICY_CHECKED.to_string(), Value::Bool(true));
             }
             if let Some(ver) = protocol_version {
-                attrs.insert(semconv::MCP_PROTOCOL_VERSION.to_string(), Value::String(ver));
+                attrs.insert(
+                    semconv::MCP_PROTOCOL_VERSION.to_string(),
+                    Value::String(ver),
+                );
             }
             if is_known_method {
                 attrs.insert(
@@ -1093,7 +1171,10 @@ async fn process_server_frame(
                 Value::String("server_to_client".to_string()),
             );
             if let Some(ver) = protocol_version {
-                attrs.insert(semconv::MCP_PROTOCOL_VERSION.to_string(), Value::String(ver));
+                attrs.insert(
+                    semconv::MCP_PROTOCOL_VERSION.to_string(),
+                    Value::String(ver),
+                );
             }
             if is_known_method {
                 attrs.insert(
@@ -1390,8 +1471,10 @@ async fn complete_pending_request(
                 .insert("error.message".to_string(), Value::String(err_msg));
         }
         if let Some(ver) = negotiated_version {
-            req.attributes
-                .insert(semconv::MCP_PROTOCOL_VERSION.to_string(), Value::String(ver));
+            req.attributes.insert(
+                semconv::MCP_PROTOCOL_VERSION.to_string(),
+                Value::String(ver),
+            );
         }
 
         let resp_msg = McpMessage {

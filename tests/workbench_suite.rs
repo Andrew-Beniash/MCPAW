@@ -208,11 +208,23 @@ async fn test_observation_fails_open_and_policy_fails_closed_with_batches() {
         .unwrap();
     let pol_out = pol_child.wait_with_output().unwrap();
     let pol_stdout = String::from_utf8_lossy(&pol_out.stdout);
-    let parsed_resps: Vec<Value> = pol_stdout
+    let raw_lines: Vec<Value> = pol_stdout
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(parsed_resps.len(), 3);
+    assert_eq!(raw_lines.len(), 3);
+    // N4: a blocked batch is answered with a JSON-RPC array, one entry per request id.
+    assert!(
+        raw_lines.iter().any(|v| v.is_array()),
+        "N4: reply to a blocked batch must be a JSON-RPC array"
+    );
+    let parsed_resps: Vec<Value> = raw_lines
+        .into_iter()
+        .flat_map(|v| match v {
+            Value::Array(items) => items,
+            other => vec![other],
+        })
+        .collect();
 
     // 1: allowed
     let resp1 = parsed_resps.iter().find(|r| r["id"] == json!(1)).unwrap();
@@ -498,12 +510,23 @@ async fn test_security_controls_ports_csp_and_secret_canary() {
         ["github", "_pat_", "11AA22BB33CC44DD55EE"].concat(),
         ["xo", "xb", "-", "1234567890-", "canarySlackToken"].concat(),
         ["AK", "IA", "CANARY0FAKE00KEY1"].concat(),
-        ["ey", "JhbGciOiJIUzI1NiJ9.", "ey", "JzdWIiOiJjYW5hcnkifQ.", "c2lnbmF0dXJl"].concat(),
+        [
+            "ey",
+            "JhbGciOiJIUzI1NiJ9.",
+            "ey",
+            "JzdWIiOiJjYW5hcnkifQ.",
+            "c2lnbmF0dXJl",
+        ]
+        .concat(),
         "super-secret-credential-val".to_string(),
     ];
     let canaries: Vec<&str> = canaries_owned.iter().map(String::as_str).collect();
 
-    for level in [CaptureLevel::Off, CaptureLevel::Metadata, CaptureLevel::Full] {
+    for level in [
+        CaptureLevel::Off,
+        CaptureLevel::Metadata,
+        CaptureLevel::Full,
+    ] {
         let lvl_temp = TempDir::new().unwrap();
         let lvl_cfg = test_config(&lvl_temp, level);
         let lvl_daemon = start_daemon(lvl_cfg, false).await.unwrap();
@@ -828,13 +851,7 @@ async fn test_chaos_fixtures_bidirectional_requests_and_protocol_eras() {
 /// - H4: Gzip-compressed LLM response is forwarded raw to client while decompressed in memory for accurate usage/cost parsing (`$0.0075`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_breaker_no_double_count_compressed_llm_cost_and_exports() {
-    use axum::{
-        body::Body,
-        http::StatusCode,
-        response::IntoResponse,
-        routing::post,
-        Router,
-    };
+    use axum::{body::Body, http::StatusCode, response::IntoResponse, routing::post, Router};
     use flate2::{write::GzEncoder, Compression};
     use tokio::net::TcpListener;
 
@@ -1025,7 +1042,7 @@ async fn test_breaker_no_double_count_compressed_llm_cost_and_exports() {
     // H2: Link model-call cost and MCP tool calls in the same run (`run-h4-gzip`).
     // A second $0.0075 LLM call brings `run-h4-gzip` to $0.0150 (> $0.01 ceiling),
     // which must cause the next MCP tool call on `run-h4-gzip` to be blocked by the Circuit Breaker!
-    let _ = client
+    let second_llm = client
         .post(format!("{}/v1/chat/completions", proxy_base))
         .header("x-llm-upstream", format!("http://{}", upstream_addr))
         .header("Accept-Encoding", "gzip")
@@ -1037,7 +1054,30 @@ async fn test_breaker_no_double_count_compressed_llm_cost_and_exports() {
         .send()
         .await
         .unwrap();
-    daemon.bus.flush().await;
+    // Drain the body: the proxy records the model call (and its cost) when the stream ends,
+    // so returning from `send()` (headers only) is not enough.
+    let _ = second_llm.bytes().await.unwrap();
+    // The recording is published just after the last chunk is sent; wait for it with a timeout
+    // instead of racing it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        daemon.bus.flush().await;
+        let cost = daemon
+            .bus
+            .store
+            .get_run("run-h4-gzip")
+            .unwrap()
+            .map(|r| r.total_cost_usd)
+            .unwrap_or(0.0);
+        if cost > 0.0149 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second LLM call cost was never recorded (run cost ${cost})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 
     let mcp_after_budget = client
         .post(format!("{}/mcp/test-http", proxy_base))
@@ -1144,7 +1184,11 @@ async fn test_policy_enabled_flag_setup_safety_and_config_resilience() {
     std::fs::write(&cfg_path, raw_ordered).unwrap();
 
     let wrapped = mcpaw::config::setup_client_config(&cfg_path, "wb", false).unwrap();
-    assert_eq!(wrapped.len(), 2, "H9: Must wrap both top-level and project-scoped mcpServers");
+    assert_eq!(
+        wrapped.len(),
+        2,
+        "H9: Must wrap both top-level and project-scoped mcpServers"
+    );
 
     let rewritten_str = std::fs::read_to_string(&cfg_path).unwrap();
     let z_pos = rewritten_str.find("\"z_first_key\"").unwrap();
@@ -1409,8 +1453,7 @@ async fn test_mcp_http_proxy_incremental_sse_manual_call_and_retention() {
     assert_eq!(manual_resp.status(), reqwest::StatusCode::OK);
     let manual_val: Value = manual_resp.json().await.unwrap();
     assert_eq!(
-        manual_val["result"]["echo"]["arguments"]["msg"],
-        "manual call with spaces in path",
+        manual_val["result"]["echo"]["arguments"]["msg"], "manual call with spaces in path",
         "M5: Manual stdio tool call must work with paths containing spaces and return result"
     );
 
@@ -1465,5 +1508,8 @@ async fn test_mcp_http_proxy_incremental_sse_manual_call_and_retention() {
         .add_annotation("run-http-jira", "tester", "note to delete")
         .unwrap();
     let deleted = daemon.bus.store.enforce_retention(0, 0).unwrap();
-    assert!(deleted > 0, "M4: Retention with 0 days must delete expired runs");
+    assert!(
+        deleted > 0,
+        "M4: Retention with 0 days must delete expired runs"
+    );
 }

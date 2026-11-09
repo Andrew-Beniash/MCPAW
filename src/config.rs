@@ -326,23 +326,48 @@ impl WbConfig {
         Ok(())
     }
 
-    /// Atomically persists the configuration to `wb.toml` via a temporary file rename (H3).
-    pub fn save_atomic(&self) -> Result<()> {
-        let target = self
-            .loaded_from
-            .clone()
-            .or_else(Self::default_config_path);
-        let Some(path) = target else {
-            return Ok(());
+    /// Atomically persists only the `[policy]` table of the config file this config was loaded
+    /// from (H3, N7). Comments and formatting elsewhere in the file are preserved via `toml_edit`.
+    /// Returns `Ok(false)` without writing when the daemon was not started from a config file, so
+    /// a file is never created at the default path as a side effect.
+    pub fn save_policy_atomic(&self, policy: &PolicyConfig) -> Result<bool> {
+        let Some(path) = self.loaded_from.clone() else {
+            return Ok(false);
         };
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = existing
+            .parse()
+            .with_context(|| format!("failed to parse {} for update", path.display()))?;
+
+        #[derive(Serialize)]
+        struct PolicyOnly<'a> {
+            policy: &'a PolicyConfig,
+        }
+        let fragment = toml::to_string_pretty(&PolicyOnly { policy })?;
+        let fragment_doc: toml_edit::DocumentMut = fragment.parse()?;
+        if let Some(item) = fragment_doc.get("policy") {
+            doc["policy"] = item.clone();
+        }
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let serialized = toml::to_string_pretty(self)?;
-        let tmp_path = path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, serialized)?;
+        let tmp_path = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
+            f.write_all(doc.to_string().as_bytes())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp_path, &path)?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn default_config_path() -> Option<PathBuf> {
@@ -421,7 +446,11 @@ fn wrap_mcp_servers_map(
         let Some(obj) = entry.as_object_mut() else {
             continue;
         };
-        let Some(cmd) = obj.get("command").and_then(|c| c.as_str()).map(String::from) else {
+        let Some(cmd) = obj
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(String::from)
+        else {
             continue;
         };
         let existing_args: Vec<String> = obj
@@ -472,11 +501,7 @@ fn wrap_mcp_servers_map(
 /// - Handles both top-level `mcpServers` and project-scoped `projects.<path>.mcpServers`
 /// - Uses timestamped backups + hash check so `--undo` refuses to clobber subsequent edits
 /// - Refuses to overwrite if the file changed on disk since read, and writes via atomic rename
-pub fn setup_client_config(
-    config_path: &Path,
-    wb_bin: &str,
-    undo: bool,
-) -> Result<Vec<String>> {
+pub fn setup_client_config(config_path: &Path, wb_bin: &str, undo: bool) -> Result<Vec<String>> {
     let meta_path = config_path.with_extension("json.wb-backup-meta");
     let legacy_backup_path = config_path.with_extension("json.wb-backup");
 
@@ -505,13 +530,17 @@ pub fn setup_client_config(
             let _ = std::fs::remove_file(&meta.backup_file);
             let _ = std::fs::remove_file(&meta_path);
             let _ = std::fs::remove_file(&legacy_backup_path);
-            return Ok(vec!["Restored original configuration from backup.".to_string()]);
+            return Ok(vec![
+                "Restored original configuration from backup.".to_string()
+            ]);
         } else if legacy_backup_path.exists() {
             let tmp_restore = config_path.with_extension("json.wb-tmp");
             std::fs::copy(&legacy_backup_path, &tmp_restore)?;
             std::fs::rename(&tmp_restore, config_path)?;
             let _ = std::fs::remove_file(&legacy_backup_path);
-            return Ok(vec!["Restored original configuration from backup.".to_string()]);
+            return Ok(vec![
+                "Restored original configuration from backup.".to_string()
+            ]);
         } else {
             bail!("No backup file found for {}", config_path.display());
         }

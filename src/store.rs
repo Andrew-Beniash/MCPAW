@@ -29,8 +29,9 @@ impl TraceStore {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let write_conn = Connection::open(db_path)
-            .with_context(|| format!("failed to open SQLite trace store at {}", db_path.display()))?;
+        let write_conn = Connection::open(db_path).with_context(|| {
+            format!("failed to open SQLite trace store at {}", db_path.display())
+        })?;
 
         // Enforce 0600 file permissions on Unix (§8 Threat Model)
         #[cfg(unix)]
@@ -219,8 +220,8 @@ impl TraceStore {
         };
         if text.len() > BLOB_THRESHOLD_BYTES {
             let blob_id = format!("blob-{}", Uuid::new_v4());
-            let compressed = zstd::encode_all(text.as_bytes(), 3)
-                .unwrap_or_else(|_| text.as_bytes().to_vec());
+            let compressed =
+                zstd::encode_all(text.as_bytes(), 3).unwrap_or_else(|_| text.as_bytes().to_vec());
             tx.execute(
                 "INSERT INTO blobs (id, compressed, data, raw_size) VALUES (?1, 1, ?2, ?3)",
                 params![blob_id, compressed, text.len() as i64],
@@ -314,7 +315,13 @@ impl TraceStore {
         tx.execute(
             "INSERT INTO runs (id, session_id, label, status, started_at, last_activity_ns)
              VALUES (?1, ?2, ?3, 'ok', ?4, ?5)",
-            params![new_run_id, session_id, run_label, now_str, timestamp_ns as i64],
+            params![
+                new_run_id,
+                session_id,
+                run_label,
+                now_str,
+                timestamp_ns as i64
+            ],
         )?;
         Ok(new_run_id)
     }
@@ -570,11 +577,12 @@ impl TraceStore {
                     )?;
 
                     for msg in mcp_messages {
-                        let (payload_ref, inline_payload) = if self.capture_level == CaptureLevel::Full {
-                            Self::store_payload(&tx, msg.payload.as_deref())?
-                        } else {
-                            (None, None)
-                        };
+                        let (payload_ref, inline_payload) =
+                            if self.capture_level == CaptureLevel::Full {
+                                Self::store_payload(&tx, msg.payload.as_deref())?
+                            } else {
+                                (None, None)
+                            };
                         let method_col = if self.capture_level == CaptureLevel::Off {
                             None
                         } else {
@@ -704,11 +712,12 @@ impl TraceStore {
                     }
 
                     if let Some(msg) = response_message {
-                        let (payload_ref, inline_payload) = if self.capture_level == CaptureLevel::Full {
-                            Self::store_payload(&tx, msg.payload.as_deref())?
-                        } else {
-                            (None, None)
-                        };
+                        let (payload_ref, inline_payload) =
+                            if self.capture_level == CaptureLevel::Full {
+                                Self::store_payload(&tx, msg.payload.as_deref())?
+                            } else {
+                                (None, None)
+                            };
                         tx.execute(
                             "INSERT INTO mcp_messages (span_id, direction, jsonrpc_id, method, payload_ref, inline_payload, bytes, timestamp_ns)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -1010,7 +1019,8 @@ impl TraceStore {
         })?;
         let mut mcp_messages = Vec::new();
         for mr in msg_rows {
-            let (id, s_id, direction, jsonrpc_id, method, p_ref, p_inline, bytes, timestamp_ns) = mr?;
+            let (id, s_id, direction, jsonrpc_id, method, p_ref, p_inline, bytes, timestamp_ns) =
+                mr?;
             let payload = Self::load_payload(&conn, p_ref, p_inline);
             mcp_messages.push(McpMessage {
                 id,

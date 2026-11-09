@@ -192,8 +192,11 @@ enum PolicyAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // H10: In `wb wrap`, if `wb.toml` is malformed, log to stderr and fall back to defaults
-    // in observation mode so the user's MCP server still launches. Exit only if `--policy` was requested.
+    // H10 + N2: In `wb wrap`, a config that fails to load must not stop the user's MCP server, but it
+    // must not silently disable a firewall either. If the raw file looks like it enables the policy
+    // (or `--policy` was passed), the wrapper fails closed on `tools/call` while still forwarding
+    // everything else, and the error names the config problem.
+    let mut wrap_config_error: Option<String> = None;
     let mut cfg = match &cli.command {
         Commands::Wrap { policy, .. } => match WbConfig::load_or_default(cli.config.as_deref()) {
             Ok(c) => c,
@@ -201,10 +204,23 @@ async fn main() -> Result<()> {
                 if *policy {
                     return Err(e);
                 }
+                let raw = raw_config_text(cli.config.as_deref());
+                let policy_may_be_enabled = raw
+                    .as_deref()
+                    .map(config_text_enables_policy)
+                    .unwrap_or(false);
                 eprintln!(
-                    "wb wrap warning: failed to load configuration ({}); continuing with default observation settings.",
-                    e
+                    "wb wrap warning: failed to load configuration ({:#}); {}",
+                    e,
+                    if policy_may_be_enabled {
+                        "policy appears to be enabled, so tools/call is blocked (fail-closed) until the config is fixed."
+                    } else {
+                        "continuing with default observation settings."
+                    }
                 );
+                if policy_may_be_enabled {
+                    wrap_config_error = Some(format!("{:#}", e));
+                }
                 WbConfig::default()
             }
         },
@@ -264,6 +280,7 @@ async fn main() -> Result<()> {
                 sock_path,
                 enforce_policy,
                 run_id,
+                wrap_config_error,
             )
             .await?;
             std::process::exit(code);
@@ -372,7 +389,10 @@ async fn main() -> Result<()> {
                                 r.status,
                                 r.span_count,
                                 r.error_count,
-                                format!("{}${:.4} [{}]", prefix, r.total_cost_usd, PRICE_TABLE_DATE),
+                                format!(
+                                    "{}${:.4} [{}]",
+                                    prefix, r.total_cost_usd, PRICE_TABLE_DATE
+                                ),
                                 r.started_at
                             );
                         }
@@ -450,11 +470,8 @@ async fn main() -> Result<()> {
                         }
                         for e in diff.entries {
                             let marker = if e.diverged { ">>" } else { "  " };
-                            let l_name = e
-                                .left_span
-                                .as_ref()
-                                .map(|s| s.name.as_str())
-                                .unwrap_or("—");
+                            let l_name =
+                                e.left_span.as_ref().map(|s| s.name.as_str()).unwrap_or("—");
                             let r_name = e
                                 .right_span
                                 .as_ref()
@@ -547,13 +564,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let policy_mod = PolicyModule::new(cfg.policy.clone());
-                let (verdict, decision) = policy_mod.evaluate_call(
-                    "cli-policy-test",
-                    &server,
-                    &tool,
-                    &args,
-                    now_ns(),
-                );
+                let (verdict, decision) =
+                    policy_mod.evaluate_call("cli-policy-test", &server, &tool, &args, now_ns());
                 let allowed = !verdict.is_blocked();
                 if json {
                     println!(
@@ -609,5 +621,68 @@ fn default_client_config_path(client: &str) -> Result<PathBuf> {
             "Unknown client '{}'. Pass --config-path explicitly or use claude-code | cursor | claude-desktop.",
             other
         ),
+    }
+}
+
+/// Reads the raw text of the config that `WbConfig::load_or_default` would have used.
+fn raw_config_text(explicit: Option<&std::path::Path>) -> Option<String> {
+    let path = explicit
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("WB_CONFIG").map(PathBuf::from))
+        .or_else(WbConfig::default_config_path)?;
+    std::fs::read_to_string(path).ok()
+}
+
+/// Best-effort check for an enabled policy in a config that failed to parse. Recognizes the three
+/// TOML spellings: a `[policy]` table with `enabled = true`, a dotted `policy.enabled = true`, and an
+/// inline `policy = { enabled = true, ... }`. When in doubt it answers `true`, because a false
+/// positive only blocks `tools/call` until the config is fixed, while a false negative turns the
+/// firewall off.
+fn config_text_enables_policy(raw: &str) -> bool {
+    let mut in_policy = false;
+    for line in raw.lines() {
+        let t = line.split('#').next().unwrap_or("").trim();
+        let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+        if compact.starts_with('[') {
+            in_policy = compact == "[policy]";
+            continue;
+        }
+        if in_policy && compact == "enabled=true" {
+            return true;
+        }
+        if compact == "policy.enabled=true" {
+            return true;
+        }
+        if compact.starts_with("policy={") && compact.contains("enabled=true") {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config_text_enables_policy;
+
+    #[test]
+    fn detects_every_toml_spelling_of_enabled_policy() {
+        assert!(config_text_enables_policy("[policy]\nenabled = true\n"));
+        assert!(config_text_enables_policy(
+            "[ policy ]\n  enabled=true # on\n"
+        ));
+        assert!(config_text_enables_policy("policy.enabled = true\n"));
+        assert!(config_text_enables_policy(
+            "policy = { enabled = true, fail_closed = true }\n"
+        ));
+    }
+
+    #[test]
+    fn ignores_disabled_or_unrelated_settings() {
+        assert!(!config_text_enables_policy("[policy]\nenabled = false\n"));
+        assert!(!config_text_enables_policy("[breaker]\nenabled = true\n"));
+        assert!(!config_text_enables_policy(
+            "# [policy]\n# enabled = true\n"
+        ));
+        assert!(!config_text_enables_policy(""));
     }
 }

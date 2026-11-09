@@ -316,7 +316,11 @@ async fn handle_mcp_http_inner(
         .get("x-wb-run-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
-        .or_else(|| header_traceparent.as_ref().map(|tp| format!("run-tp-{}", tp)))
+        .or_else(|| {
+            header_traceparent
+                .as_ref()
+                .map(|tp| format!("run-tp-{}", tp))
+        })
         .unwrap_or_else(|| "auto".to_string());
 
     let req_bytes = match axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await {
@@ -331,12 +335,8 @@ async fn handle_mcp_http_inner(
     };
 
     let req_str = String::from_utf8_lossy(&req_bytes).into_owned();
-    let parsed_req = parse_mcp_payload(
-        &req_str,
-        &server_id,
-        header_proto_version.as_deref(),
-        false,
-    );
+    let parsed_req =
+        parse_mcp_payload(&req_str, &server_id, header_proto_version.as_deref(), false);
 
     // Register server observation
     state.bus.publish(WorkbenchEvent::ServerObserved {
@@ -462,8 +462,8 @@ async fn handle_mcp_http_inner(
     }
 
     // M6: Map all HTTP methods and preserve multi-value & non-ASCII headers
-    let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-        .unwrap_or(reqwest::Method::POST);
+    let req_method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST);
     let mut upstream_req = state.http_client.request(req_method, &target_url);
     for (k, v) in headers.iter() {
         let name = k.as_str().to_lowercase();
@@ -585,10 +585,7 @@ async fn handle_mcp_http_inner(
                 }
                 Err(e) => {
                     let _ = client_tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )))
+                        .send(Err(std::io::Error::other(e.to_string())))
                         .await;
                     break;
                 }
@@ -597,8 +594,7 @@ async fn handle_mcp_http_inner(
 
         if !is_get_sse {
             let end_ns = now_ns();
-            let resp_raw =
-                decompress_for_observation(&collected, content_encoding.as_deref());
+            let resp_raw = decompress_for_observation(&collected, content_encoding.as_deref());
             record_http_mcp_exchange(
                 &bus_clone,
                 &server_id,
@@ -936,10 +932,7 @@ fn decompress_for_observation(raw_bytes: &[u8], content_encoding: Option<&str>) 
 
 /// Proxies OpenAI-compatible (`/v1/chat/completions`, `/v1/responses`) and
 /// Anthropic-compatible (`/v1/messages`) LLM requests, supporting both JSON and streaming SSE (§4.1, §11).
-async fn handle_llm_proxy(
-    State(state): State<ProxyState>,
-    req: Request,
-) -> Response {
+async fn handle_llm_proxy(State(state): State<ProxyState>, req: Request) -> Response {
     let start_ns = now_ns();
     let uri_path = req.uri().path().to_string();
     let headers = req.headers().clone();
@@ -963,7 +956,11 @@ async fn handle_llm_proxy(
         .get("x-wb-run-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
-        .or_else(|| header_traceparent.as_ref().map(|tp| format!("run-tp-{}", tp)))
+        .or_else(|| {
+            header_traceparent
+                .as_ref()
+                .map(|tp| format!("run-tp-{}", tp))
+        })
         .unwrap_or_else(|| "auto".to_string());
 
     // H2: Check Circuit Breaker budget keyed by run_id before forwarding LLM call
@@ -1183,10 +1180,7 @@ async fn handle_llm_proxy(
                 }
                 Err(e) => {
                     let _ = client_tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            e.to_string(),
-                        )))
+                        .send(Err(std::io::Error::other(e.to_string())))
                         .await;
                     break;
                 }

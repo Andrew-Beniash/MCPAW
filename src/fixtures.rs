@@ -226,7 +226,12 @@ pub fn run_stdio_fixture(kind: &str) -> Result<i32> {
                                 "message": "Approve payment of $500?"
                             }
                         });
-                        write!(writer, "{}{}", serde_json::to_string(&srv_req)?, line_ending)?;
+                        write!(
+                            writer,
+                            "{}{}",
+                            serde_json::to_string(&srv_req)?,
+                            line_ending
+                        )?;
                         writer.flush()?;
 
                         // Wait for client's JSON-RPC response to `srv-elic-1`

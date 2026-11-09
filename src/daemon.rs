@@ -74,10 +74,7 @@ fn write_ui_token_secure(token_path: &Path, ui_token: &str) {
     }
 }
 
-pub async fn start_daemon(
-    config: WbConfig,
-    allow_non_loopback: bool,
-) -> Result<RunningDaemon> {
+pub async fn start_daemon(config: WbConfig, allow_non_loopback: bool) -> Result<RunningDaemon> {
     // 1. Validate bind address (§8)
     config.validate_bind_address(allow_non_loopback)?;
 
