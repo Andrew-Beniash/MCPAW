@@ -1,17 +1,17 @@
 use crate::config::{BreakerConfig, PolicyConfig, PolicyEffect, PolicyRule};
+use crate::mcp_parser::canonicalize_json;
 use crate::models::{
     semconv, ContextBreakdown, PolicyDecision, SpanKind, Verdict, WorkbenchEvent,
 };
 use crate::pricing::PriceTable;
+use anyhow::Result;
 use axum::Router;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 /// Module trait as specified in §4.1:
-/// ```rust
-/// # use mcpaw::models::{WorkbenchEvent, Verdict};
-/// # use axum::Router;
+/// ```ignore
 /// trait Module {
 ///     fn on_event(&mut self, ev: &WorkbenchEvent) -> Verdict;
 ///     fn routes(&self) -> Option<Router>;
@@ -36,25 +36,21 @@ pub fn analyze_context_window(req_json: &Value, actual_input_tokens: Option<u64>
     let mut by_tool_result: BTreeMap<String, u64> = BTreeMap::new();
     let mut tool_call_id_to_name: HashMap<String, String> = HashMap::new();
 
-    // Anthropic top-level `system` field
     if let Some(sys) = req_json.get("system") {
         system_tokens += PriceTable::estimate_tokens(&sys.to_string());
     }
 
-    // Tool definitions (`tools` array)
     if let Some(tools) = req_json.get("tools").and_then(|t| t.as_array()) {
         for tool in tools {
             tools_tokens += PriceTable::estimate_tokens(&tool.to_string());
         }
     }
 
-    // Messages array (OpenAI and Anthropic)
     if let Some(messages) = req_json.get("messages").and_then(|m| m.as_array()) {
         for msg in messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = msg.get("content");
 
-            // Track tool_calls in assistant messages so we can attribute tool results by name
             if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
                     if let (Some(id), Some(name)) = (
@@ -69,7 +65,6 @@ pub fn analyze_context_window(req_json: &Value, actual_input_tokens: Option<u64>
                 }
             }
 
-            // Check if Anthropic content array has tool_use or tool_result blocks
             if let Some(Value::Array(blocks)) = content {
                 let mut block_handled = false;
                 for block in blocks {
@@ -150,7 +145,6 @@ pub fn analyze_context_window(req_json: &Value, actual_input_tokens: Option<u64>
     let raw_sum =
         system_tokens + tools_tokens + user_tokens + assistant_tokens + tool_results_tokens;
 
-    // Scale category estimates proportionally if provider supplied exact input_tokens
     if let Some(actual) = actual_input_tokens {
         if raw_sum > 0 && actual > 0 {
             let scale = actual as f64 / raw_sum as f64;
@@ -200,35 +194,48 @@ pub fn analyze_context_window(req_json: &Value, actual_input_tokens: Option<u64>
     }
 }
 
-/// Circuit Breaker module (F-12, UC-03): detects repetitive tool loops and budget overruns.
+/// Circuit Breaker module (F-12, UC-03, H1, H2):
+/// Keys state by run (defaulting `"auto"` to the active run bucket so LLM and MCP traffic share ceilings)
+/// and counts consecutive identical `(server, tool, canonical_args)` repeats.
 pub struct BreakerModule {
     pub config: BreakerConfig,
-    session_cost_usd: HashMap<String, f64>,
-    session_tokens: HashMap<String, u64>,
-    tool_call_counts: HashMap<(String, String, String), u32>,
+    run_cost_usd: HashMap<String, f64>,
+    run_tokens: HashMap<String, u64>,
+    /// Maps `run_key -> (last_call_signature, consecutive_count)`
+    consecutive_tool_calls: HashMap<String, (String, u32)>,
 }
 
 impl BreakerModule {
     pub fn new(config: BreakerConfig) -> Self {
         Self {
             config,
-            session_cost_usd: HashMap::new(),
-            session_tokens: HashMap::new(),
-            tool_call_counts: HashMap::new(),
+            run_cost_usd: HashMap::new(),
+            run_tokens: HashMap::new(),
+            consecutive_tool_calls: HashMap::new(),
+        }
+    }
+
+    pub fn normalize_run_key(run_id: &str) -> String {
+        if run_id.is_empty() || run_id == "auto" {
+            "active-run".to_string()
+        } else {
+            run_id.to_string()
         }
     }
 
     pub fn check_tool_call(
         &mut self,
-        session_key: &str,
+        run_id: &str,
         server_id: &str,
         tool_name: &str,
-        canonical_args: &str,
+        arguments_raw: &str,
     ) -> Verdict {
         if !self.config.enabled {
             return Verdict::Pass;
         }
-        if let Some(&cost) = self.session_cost_usd.get(session_key) {
+        let rkey = Self::normalize_run_key(run_id);
+
+        if let Some(&cost) = self.run_cost_usd.get(&rkey) {
             if cost > self.config.max_run_cost_usd {
                 return Verdict::Block(format!(
                     "Circuit Breaker: run cost ${:.4} exceeded budget ceiling ${:.2}",
@@ -236,7 +243,7 @@ impl BreakerModule {
                 ));
             }
         }
-        if let Some(&tokens) = self.session_tokens.get(session_key) {
+        if let Some(&tokens) = self.run_tokens.get(&rkey) {
             if tokens > self.config.max_run_tokens {
                 return Verdict::Block(format!(
                     "Circuit Breaker: run tokens {} exceeded budget ceiling {}",
@@ -245,29 +252,38 @@ impl BreakerModule {
             }
         }
 
-        let key = (
-            session_key.to_string(),
-            format!("{}:{}", server_id, tool_name),
-            canonical_args.to_string(),
-        );
-        let count = self.tool_call_counts.entry(key).or_insert(0);
-        *count += 1;
+        let canonical_args = serde_json::from_str::<Value>(arguments_raw)
+            .map(|v| canonicalize_json(&v))
+            .unwrap_or_else(|_| arguments_raw.trim().to_string());
+        let signature = format!("{}:{}:{}", server_id, tool_name, canonical_args);
 
-        if *count > self.config.max_identical_tool_calls {
+        let entry = self
+            .consecutive_tool_calls
+            .entry(rkey)
+            .or_insert_with(|| (String::new(), 0));
+        if entry.0 == signature {
+            entry.1 += 1;
+        } else {
+            entry.0 = signature;
+            entry.1 = 1;
+        }
+
+        if entry.1 > self.config.max_identical_tool_calls {
             return Verdict::Block(format!(
-                "Circuit Breaker: repetitive loop detected — tool '{}:{}' called {} times with identical arguments (limit: {})",
-                server_id, tool_name, *count, self.config.max_identical_tool_calls
+                "Circuit Breaker: repetitive loop detected — tool '{}:{}' called {} consecutive times with identical arguments (limit: {})",
+                server_id, tool_name, entry.1, self.config.max_identical_tool_calls
             ));
         }
 
         Verdict::Pass
     }
 
-    pub fn check_llm_call(&self, session_key: &str) -> Verdict {
+    pub fn check_llm_call(&self, run_id: &str) -> Verdict {
         if !self.config.enabled {
             return Verdict::Pass;
         }
-        if let Some(&cost) = self.session_cost_usd.get(session_key) {
+        let rkey = Self::normalize_run_key(run_id);
+        if let Some(&cost) = self.run_cost_usd.get(&rkey) {
             if cost > self.config.max_run_cost_usd {
                 return Verdict::Block(format!(
                     "Circuit Breaker: run cost ${:.4} exceeded budget ceiling ${:.2}",
@@ -275,7 +291,7 @@ impl BreakerModule {
                 ));
             }
         }
-        if let Some(&tokens) = self.session_tokens.get(session_key) {
+        if let Some(&tokens) = self.run_tokens.get(&rkey) {
             if tokens > self.config.max_run_tokens {
                 return Verdict::Block(format!(
                     "Circuit Breaker: run tokens {} exceeded budget ceiling {}",
@@ -297,31 +313,51 @@ impl Module for BreakerModule {
             return Verdict::Pass;
         }
         if let WorkbenchEvent::SpanRecorded {
-            span,
-            session_id,
-            model_call,
-            ..
+            span, model_call, ..
         } = ev
         {
+            let rkey = Self::normalize_run_key(&span.run_id);
             if let Some(mc) = model_call {
-                let cost_entry = self.session_cost_usd.entry(session_id.clone()).or_insert(0.0);
-                *cost_entry += mc.cost_usd;
-                let tok_entry = self.session_tokens.entry(session_id.clone()).or_insert(0);
-                *tok_entry += mc.input_tokens + mc.output_tokens;
+                let new_cost = {
+                    let cost_entry = self.run_cost_usd.entry(rkey.clone()).or_insert(0.0);
+                    *cost_entry += mc.cost_usd;
+                    *cost_entry
+                };
+                let new_tok = {
+                    let tok_entry = self.run_tokens.entry(rkey.clone()).or_insert(0);
+                    *tok_entry += mc.input_tokens + mc.output_tokens;
+                    *tok_entry
+                };
 
-                if *cost_entry > self.config.max_run_cost_usd {
+                // Also update `"active-run"` bucket so unmarked MCP tool calls see the accumulated cost
+                if rkey != "active-run" {
+                    *self.run_cost_usd.entry("active-run".to_string()).or_insert(0.0) += mc.cost_usd;
+                    *self.run_tokens.entry("active-run".to_string()).or_insert(0) +=
+                        mc.input_tokens + mc.output_tokens;
+                }
+
+                if new_cost > self.config.max_run_cost_usd {
                     return Verdict::Block(format!(
                         "Circuit Breaker: run cost ${:.4} exceeded budget ceiling ${:.2}",
-                        *cost_entry, self.config.max_run_cost_usd
+                        new_cost, self.config.max_run_cost_usd
                     ));
                 }
-                if *tok_entry > self.config.max_run_tokens {
+                if new_tok > self.config.max_run_tokens {
                     return Verdict::Block(format!(
                         "Circuit Breaker: run tokens {} exceeded budget ceiling {}",
-                        *tok_entry, self.config.max_run_tokens
+                        new_tok, self.config.max_run_tokens
                     ));
                 }
             } else if span.kind == SpanKind::Mcp {
+                // H1: Skip double-counting if this span already passed `check_tool_call_policy`
+                if span
+                    .attributes
+                    .get(semconv::WB_POLICY_CHECKED)
+                    .and_then(|v| v.as_bool())
+                    == Some(true)
+                {
+                    return Verdict::Pass;
+                }
                 if let (Some(server_id), Some(tool_name)) = (
                     span.attributes
                         .get(semconv::MCP_SERVER_ID)
@@ -335,7 +371,7 @@ impl Module for BreakerModule {
                         .get(semconv::GEN_AI_TOOL_CALL_ARGUMENTS)
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
-                    return self.check_tool_call(session_id, server_id, tool_name, args);
+                    return self.check_tool_call(&span.run_id, server_id, tool_name, args);
                 }
             }
         }
@@ -365,20 +401,47 @@ impl Module for XRayModule {
     }
 }
 
-/// Policy / Firewall module (F-13, §8).
+struct CompiledRule {
+    rule: PolicyRule,
+    compiled_regex: Option<Regex>,
+}
+
+/// Policy / Firewall module (F-13, §8, H3, M9, M10).
 pub struct PolicyModule {
     pub config: PolicyConfig,
+    compiled_rules: Vec<CompiledRule>,
     changed_tools: HashMap<(String, String), String>,
     seen_tool_hashes: HashMap<(String, String), String>,
 }
 
 impl PolicyModule {
     pub fn new(config: PolicyConfig) -> Self {
+        let compiled_rules = Self::compile_rules(&config.rules);
         Self {
             config,
+            compiled_rules,
             changed_tools: HashMap::new(),
             seen_tool_hashes: HashMap::new(),
         }
+    }
+
+    fn compile_rules(rules: &[PolicyRule]) -> Vec<CompiledRule> {
+        rules
+            .iter()
+            .filter_map(|r| {
+                let compiled_regex = match &r.arg_pattern {
+                    Some(pat) if !pat.is_empty() => match Regex::new(pat) {
+                        Ok(re) => Some(re),
+                        Err(_) => return None,
+                    },
+                    _ => None,
+                };
+                Some(CompiledRule {
+                    rule: r.clone(),
+                    compiled_regex,
+                })
+            })
+            .collect()
     }
 
     pub fn evaluate_call(
@@ -389,7 +452,8 @@ impl PolicyModule {
         arguments_raw: &str,
         timestamp_ns: u64,
     ) -> (Verdict, Option<PolicyDecision>) {
-        if !self.config.enabled && self.config.rules.is_empty() {
+        // H3: When `enabled = false`, policy rules must NOT be enforced!
+        if !self.config.enabled {
             return (Verdict::Pass, None);
         }
 
@@ -418,22 +482,17 @@ impl PolicyModule {
             }
         }
 
-        for rule in &self.config.rules {
+        for cr in &self.compiled_rules {
+            let rule = &cr.rule;
             if !wildcard_match(&rule.server, server_id) {
                 continue;
             }
             if !wildcard_match(&rule.tool, tool_name) {
                 continue;
             }
-            if let Some(ref pat) = rule.arg_pattern {
-                if !pat.is_empty() {
-                    let matched = match Regex::new(pat) {
-                        Ok(re) => re.is_match(arguments_raw),
-                        Err(_) => arguments_raw.contains(pat),
-                    };
-                    if !matched {
-                        continue;
-                    }
+            if let Some(ref re) = cr.compiled_regex {
+                if !re.is_match(arguments_raw) {
+                    continue;
                 }
             }
 
@@ -469,9 +528,14 @@ impl PolicyModule {
         (Verdict::Pass, None)
     }
 
-    pub fn update_rules(&mut self, enabled: bool, rules: Vec<PolicyRule>) {
+    pub fn update_rules(&mut self, enabled: bool, rules: Vec<PolicyRule>) -> Result<()> {
+        for r in &rules {
+            r.validate()?;
+        }
+        self.compiled_rules = Self::compile_rules(&rules);
         self.config.enabled = enabled;
         self.config.rules = rules;
+        Ok(())
     }
 }
 
@@ -496,6 +560,14 @@ impl Module for PolicyModule {
             }
             WorkbenchEvent::SpanRecorded { span, .. } => {
                 if span.kind == SpanKind::Mcp {
+                    if span
+                        .attributes
+                        .get(semconv::WB_POLICY_CHECKED)
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                    {
+                        return Verdict::Pass;
+                    }
                     if let (Some(server_id), Some(tool_name)) = (
                         span.attributes
                             .get(semconv::MCP_SERVER_ID)
@@ -526,14 +598,17 @@ impl Module for PolicyModule {
     }
 }
 
-fn wildcard_match(pattern: &str, value: &str) -> bool {
+/// Case-insensitive wildcard matcher (M10: both prefix `write_*` and exact matches are case-insensitive).
+pub fn wildcard_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern.is_empty() {
         return true;
     }
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return value.starts_with(prefix);
+    let pat_lower = pattern.to_lowercase();
+    let val_lower = value.to_lowercase();
+    if let Some(prefix) = pat_lower.strip_suffix('*') {
+        return val_lower.starts_with(prefix);
     }
-    pattern.eq_ignore_ascii_case(value)
+    pat_lower == val_lower
 }
 
 /// Hosts all compiled modules over the shared event stream (§4.1).

@@ -71,7 +71,9 @@ The Workbench serves as the shared proxy core and UI shell for the full local ag
 
 ### 1. Build from Source
 
-Requires Rust 1.80+ (`cargo`):
+**Platform support**: macOS and Linux (Unix domain sockets are used for low-latency IPC between `wb wrap` and `wbd`; Windows builds compile in direct pass-through mode without local Unix socket IPC).
+
+Requires Rust 1.84+ (`cargo`):
 
 ```bash
 cargo build --release
@@ -232,6 +234,15 @@ Run the full test suite with:
 ```bash
 cargo test
 ```
+
+---
+
+## Known Limitations (v0.1)
+
+- **Platform IPC**: Low-latency local IPC between `wb wrap` and `wbd` currently uses Unix domain sockets (`~/.local/share/workbench/wbd.sock`) and is supported on **macOS and Linux**. On non-Unix targets, `wb wrap` compiles and forwards stdio traffic in standalone pass-through mode.
+- **Tokenizer Approximation**: When an LLM streaming response omits a final `usage` block (or when profiling per-message context segments in Context Window X-Ray), token counts are estimated using a fast UTF-8 character/word heuristic and explicitly badged with `~` (`cost_estimated = true`).
+- **OTLP Export**: Runs can be exported on demand via `wb export --format otlp` or `/api/export` and ingested via `/api/ingest/otel`; continuous background push to a remote OTLP collector endpoint (`export.otlp_endpoint`) is scheduled for v0.2.
+- **In-Memory SSE Observation Cap**: For arbitrarily long-running HTTP responses, in-memory payload buffering for observation is capped at 16 MB per request while raw network bytes continue streaming untouched to the client.
 
 ---
 

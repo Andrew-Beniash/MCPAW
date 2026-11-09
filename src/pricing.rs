@@ -172,6 +172,6 @@ impl PriceTable {
         if text.is_empty() {
             return 0;
         }
-        ((text.chars().count() as u64) + 3) / 4
+        (text.chars().count() as u64).div_ceil(4)
     }
 }

@@ -1,13 +1,17 @@
-use crate::models::{ToolDefinition};
+use crate::models::ToolDefinition;
 use chrono::Utc;
 use regex::Regex;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone)]
 pub enum ParsedMcpFrame {
     Request {
-        id: String,
+        /// Canonical JSON representation of `id` (`"1"` vs `"\"1\""`) so string and integer IDs never collide (M7)
+        id_key: String,
+        /// Exact JSON `id` value (`Value::Number` or `Value::String`)
+        id_raw: Value,
         method: String,
         is_known_method: bool,
         protocol_version: Option<String>,
@@ -24,7 +28,8 @@ pub enum ParsedMcpFrame {
         client_version: Option<String>,
     },
     Response {
-        id: String,
+        id_key: String,
+        id_raw: Value,
         is_error: bool,
         error_message: Option<String>,
         negotiated_version: Option<String>,
@@ -53,24 +58,63 @@ pub fn compute_schema_hash(name: &str, description: &str, input_schema: &Value) 
     hex::encode(hasher.finalize())
 }
 
+/// Produces a deterministic, key-sorted JSON string for hashing regardless of `preserve_order`.
 pub fn canonicalize_json(val: &Value) -> String {
-    serde_json::to_string(val).unwrap_or_default()
+    match val {
+        Value::Object(map) => {
+            let mut sorted: Vec<(&String, &Value)> = map.iter().collect();
+            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let inner: Vec<String> = sorted
+                .into_iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        canonicalize_json(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", inner.join(","))
+        }
+        Value::Array(arr) => {
+            let inner: Vec<String> = arr.iter().map(canonicalize_json).collect();
+            format!("[{}]", inner.join(","))
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
 }
 
-/// Scans a tool description for suspicious prompt-injection / tool-poisoning signals (UC-05, Pain Point #7).
+static POISON_CHECKS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    let specs: &[(&str, &'static str)] = &[
+        (
+            r"(?i)(~/.ssh|/etc/passwd|/etc/shadow|\.env|id_rsa)",
+            "References sensitive local file paths (e.g. ~/.ssh, .env)",
+        ),
+        (
+            r"(?i)(ignore\s+(all\s+)?previous\s+instructions|do\s+not\s+tell\s+the\s+user|hide\s+this\s+from)",
+            "Contains covert instruction override phrasing",
+        ),
+        (
+            r"(?i)(also\s+send|exfiltrate|forward\s+the\s+contents\s+of|silently\s+call)",
+            "Instructs model to silently exfiltrate or side-channel data",
+        ),
+        (
+            r"(?i)(<important>|<system>|<!--|\[system\])",
+            "Contains embedded pseudo-system tags or HTML comments",
+        ),
+    ];
+    specs
+        .iter()
+        .filter_map(|(pat, msg)| Regex::new(pat).ok().map(|re| (re, *msg)))
+        .collect()
+});
+
+/// Scans a tool description for suspicious prompt-injection / tool-poisoning signals (UC-05, Pain Point #7, M9).
 pub fn scan_tool_poisoning(description: &str) -> Vec<String> {
     let mut warnings = Vec::new();
-    let checks: &[(&str, &str)] = &[
-        (r"(?i)(~/.ssh|/etc/passwd|/etc/shadow|\.env|id_rsa)", "References sensitive local file paths (e.g. ~/.ssh, .env)"),
-        (r"(?i)(ignore\s+(all\s+)?previous\s+instructions|do\s+not\s+tell\s+the\s+user|hide\s+this\s+from)", "Contains covert instruction override phrasing"),
-        (r"(?i)(also\s+send|exfiltrate|forward\s+the\s+contents\s+of|silently\s+call)", "Instructs model to silently exfiltrate or side-channel data"),
-        (r"(?i)(<important>|<system>|<!--|\[system\])", "Contains embedded pseudo-system tags or HTML comments"),
-    ];
-    for (pattern, msg) in checks {
-        if let Ok(re) = Regex::new(pattern) {
-            if re.is_match(description) {
-                warnings.push((*msg).to_string());
-            }
+    for (re, msg) in POISON_CHECKS.iter() {
+        if re.is_match(description) {
+            warnings.push((*msg).to_string());
         }
     }
     warnings
@@ -124,6 +168,10 @@ pub fn detect_deprecated_feature(method: &str) -> Option<String> {
     }
 }
 
+/// Classifies the MCP protocol era (H8).
+/// Reads `io.modelcontextprotocol/protocolVersion` or `protocolVersion` in `_meta`,
+/// `MCP-Protocol-Version` HTTP header, or the negotiated `initialize` version.
+/// Labels `"unknown"` when no version or `initialize` handshake is present instead of assuming stateless.
 pub fn classify_protocol_era(
     method: &str,
     meta_version: Option<&str>,
@@ -144,11 +192,12 @@ pub fn classify_protocol_era(
         if v.starts_with("2024-") {
             return (Some(v.clone()), "2024-11-05 (legacy)".to_string());
         }
+        return (Some(v.clone()), format!("{} (custom)", v));
     }
     if method == "initialize" || session_has_initialize {
-        (explicit_ver, "2024-11-05/2025-11-25 (stateful)".to_string())
+        (None, "2024-11-05/2025-11-25 (stateful)".to_string())
     } else {
-        (explicit_ver, "2026-07-28 (stateless)".to_string())
+        (None, "unknown".to_string())
     }
 }
 
@@ -168,12 +217,59 @@ pub fn parse_mcp_payload(
     parse_mcp_value(&val, server_id, header_protocol_version, session_has_initialize)
 }
 
-fn jsonrpc_id_to_string(v: &Value) -> Option<String> {
+/// Canonicalizes a JSON-RPC `id` so string `"1"` (`"\"1\""`) and integer `1` (`"1"`) remain distinct (M7).
+pub fn jsonrpc_id_to_key(v: &Value) -> Option<(String, Value)> {
     match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
+        Value::String(_) | Value::Number(_) => {
+            let key = serde_json::to_string(v).ok()?;
+            Some((key, v.clone()))
+        }
         _ => None,
     }
+}
+
+/// Extracts all `tools/call` invocations from either a single JSON-RPC request object
+/// OR a JSON-RPC batch array (B3: prevents batch policy bypass).
+pub fn extract_tools_call_checks(raw: &str) -> Vec<(Value, String, String)> {
+    let mut out = Vec::new();
+    let Ok(val) = serde_json::from_str::<Value>(raw.trim()) else {
+        return out;
+    };
+    match val {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(entry) = extract_single_tools_call(&item) {
+                    out.push(entry);
+                }
+            }
+        }
+        other => {
+            if let Some(entry) = extract_single_tools_call(&other) {
+                out.push(entry);
+            }
+        }
+    }
+    out
+}
+
+fn extract_single_tools_call(val: &Value) -> Option<(Value, String, String)> {
+    let obj = val.as_object()?;
+    let method = obj.get("method")?.as_str()?;
+    if method != "tools/call" {
+        return None;
+    }
+    let id_val = obj.get("id").cloned().unwrap_or(Value::Null);
+    let params = obj.get("params");
+    let tool_name = params
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args_raw = params
+        .and_then(|p| p.get("arguments"))
+        .map(canonicalize_json)
+        .unwrap_or_else(|| "{}".to_string());
+    Some((id_val, tool_name, args_raw))
 }
 
 pub fn parse_mcp_value(
@@ -194,15 +290,16 @@ pub fn parse_mcp_value(
         return ParsedMcpFrame::Malformed;
     };
 
-    let id = obj.get("id").and_then(jsonrpc_id_to_string);
+    let id_pair = obj.get("id").and_then(jsonrpc_id_to_key);
     let method = obj.get("method").and_then(|m| m.as_str()).map(String::from);
     let params = obj.get("params");
 
-    // Extract `_meta` fields if present
+    // H8: Read `io.modelcontextprotocol/protocolVersion` as well as `protocolVersion` / `mcpProtocolVersion` in `_meta`
     let meta = params.and_then(|p| p.get("_meta")).and_then(|m| m.as_object());
     let meta_version = meta
         .and_then(|m| {
-            m.get("protocolVersion")
+            m.get("io.modelcontextprotocol/protocolVersion")
+                .or_else(|| m.get("protocolVersion"))
                 .or_else(|| m.get("mcpProtocolVersion"))
                 .or_else(|| m.get("version"))
         })
@@ -222,8 +319,8 @@ pub fn parse_mcp_value(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    match (id, method) {
-        (Some(req_id), Some(method_name)) => {
+    match (id_pair, method) {
+        (Some((id_key, id_raw)), Some(method_name)) => {
             let known = is_known_mcp_method(&method_name);
             let deprecated_feature = detect_deprecated_feature(&method_name);
             let is_elicitation = method_name.starts_with("elicitation/");
@@ -242,7 +339,8 @@ pub fn parse_mcp_value(
                     tool_name = p.get("name").and_then(|n| n.as_str()).map(String::from);
                     if let Some(args) = p.get("arguments") {
                         let canonical = canonicalize_json(args);
-                        tool_arguments_raw = Some(canonical.clone());
+                        let raw_str = serde_json::to_string(args).unwrap_or_else(|_| canonical.clone());
+                        tool_arguments_raw = Some(raw_str);
                         tool_arguments_canonical = Some(canonical);
                     } else {
                         tool_arguments_raw = Some("{}".to_string());
@@ -253,7 +351,11 @@ pub fn parse_mcp_value(
 
             let task_id = params
                 .and_then(|p| p.get("taskId").or_else(|| p.get("id")))
-                .and_then(jsonrpc_id_to_string)
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
                 .filter(|_| method_name.starts_with("tasks/"));
 
             let client_name = params
@@ -268,7 +370,8 @@ pub fn parse_mcp_value(
                 .map(String::from);
 
             ParsedMcpFrame::Request {
-                id: req_id,
+                id_key,
+                id_raw,
                 method: method_name,
                 is_known_method: known,
                 protocol_version,
@@ -299,7 +402,7 @@ pub fn parse_mcp_value(
                 deprecated_feature,
             }
         }
-        (Some(resp_id), None) => {
+        (Some((id_key, id_raw)), None) => {
             let error_obj = obj.get("error");
             let result_obj = obj.get("result");
             if error_obj.is_none() && result_obj.is_none() {
@@ -325,7 +428,11 @@ pub fn parse_mcp_value(
 
             let task_id = result_obj
                 .and_then(|r| r.get("taskId"))
-                .and_then(jsonrpc_id_to_string);
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
 
             let discovered_tools = result_obj
                 .and_then(|r| r.get("tools"))
@@ -365,10 +472,11 @@ pub fn parse_mcp_value(
                         .collect()
                 });
 
-            let result_raw = result_obj.map(canonicalize_json);
+            let result_raw = result_obj.map(|r| serde_json::to_string(r).unwrap_or_default());
 
             ParsedMcpFrame::Response {
-                id: resp_id,
+                id_key,
+                id_raw,
                 is_error,
                 error_message,
                 negotiated_version,

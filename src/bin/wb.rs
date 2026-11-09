@@ -39,6 +39,8 @@ enum Commands {
         mcp_port: Option<u16>,
         #[arg(long)]
         ui_port: Option<u16>,
+        #[arg(long, default_value_t = false)]
+        dev: bool,
         #[arg(long = "i-understand-this-exposes-traffic", default_value_t = false)]
         allow_non_loopback: bool,
     },
@@ -189,7 +191,27 @@ enum PolicyAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut cfg = WbConfig::load_or_default(cli.config.as_deref())?;
+
+    // H10: In `wb wrap`, if `wb.toml` is malformed, log to stderr and fall back to defaults
+    // in observation mode so the user's MCP server still launches. Exit only if `--policy` was requested.
+    let mut cfg = match &cli.command {
+        Commands::Wrap { policy, .. } => match WbConfig::load_or_default(cli.config.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                if *policy {
+                    return Err(e);
+                }
+                eprintln!(
+                    "wb wrap warning: failed to load configuration ({}); continuing with default observation settings.",
+                    e
+                );
+                WbConfig::default()
+            }
+        },
+        Commands::Fixture { .. } => WbConfig::default(),
+        _ => WbConfig::load_or_default(cli.config.as_deref())?,
+    };
+
     if let Some(dd) = cli.data_dir {
         cfg.daemon.data_dir = Some(dd);
     }
@@ -199,6 +221,7 @@ async fn main() -> Result<()> {
             bind,
             mcp_port,
             ui_port,
+            dev,
             allow_non_loopback,
         } => {
             if let Some(b) = bind {
@@ -209,6 +232,9 @@ async fn main() -> Result<()> {
             }
             if let Some(up) = ui_port {
                 cfg.daemon.ui_port = up;
+            }
+            if dev {
+                cfg.daemon.dev_mode = true;
             }
             let daemon = start_daemon(cfg, allow_non_loopback).await?;
             println!("MCP and Agent Workbench daemon running:");
@@ -335,8 +361,8 @@ async fn main() -> Result<()> {
                         println!("No runs recorded.");
                     } else {
                         println!(
-                            "{:<40} {:<8} {:<6} {:<6} {:<18} {}",
-                            "RUN ID", "STATUS", "SPANS", "ERRS", "COST (USD)", "STARTED AT"
+                            "{:<40} {:<8} {:<6} {:<6} {:<18} STARTED AT",
+                            "RUN ID", "STATUS", "SPANS", "ERRS", "COST (USD)"
                         );
                         for r in runs {
                             let prefix = if r.estimated_cost { "~" } else { "" };
@@ -434,7 +460,10 @@ async fn main() -> Result<()> {
                                 .as_ref()
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("—");
-                            println!("{} #{:<3} {:<28} | {:<28}", marker, e.step_index, l_name, r_name);
+                            println!(
+                                "{} #{:<3} {:<28} | {:<28}",
+                                marker, e.step_index, l_name, r_name
+                            );
                         }
                     }
                 }
@@ -458,18 +487,27 @@ async fn main() -> Result<()> {
                 })
                 .unwrap_or_default();
 
-            let raw = match format.to_lowercase().as_str() {
+            // M14: Reject unknown export format
+            let fmt = format.to_lowercase();
+            let raw = match fmt.as_str() {
                 "otlp" => serde_json::to_string_pretty(&store.export_otlp(&run_ids)?)?,
                 "mockmcp" => serde_json::to_string_pretty(&store.export_mockmcp(&run_ids)?)?,
-                _ => store.export_jsonl(&run_ids)?,
+                "jsonl" => store.export_jsonl(&run_ids)?,
+                other => bail!(
+                    "Unsupported export format '{}'. Valid formats: jsonl, otlp, mockmcp",
+                    other
+                ),
             };
             let redacted = redactor.redact_str(&raw);
 
+            // M14: Print preview summary and first 4 KB of redacted content
             if preview {
+                let sample: String = redacted.chars().take(4096).collect();
                 eprintln!(
-                    "=== Export Preview (format={}, {} bytes after redaction) ===",
-                    format,
-                    redacted.len()
+                    "=== Export Preview (format={}, {} bytes after redaction) ===\n{}",
+                    fmt,
+                    redacted.len(),
+                    sample
                 );
             }
             if let Some(out_path) = output {

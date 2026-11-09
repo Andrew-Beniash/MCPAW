@@ -1,6 +1,43 @@
 use crate::config::PolicyEffect;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+
+/// Normalizes a W3C `traceparent` (`00-<32hex>-<16hex>-<flags>`) or arbitrary identifier
+/// into a valid 32-character lowercase hexadecimal OpenTelemetry `traceId`.
+pub fn normalize_trace_id(input: &str) -> String {
+    let trimmed = input.trim();
+    // Check W3C traceparent format: version(2)-trace_id(32)-parent_id(16)-flags(2)
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() == 4
+        && parts[0].len() == 2
+        && parts[1].len() == 32
+        && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return parts[1].to_lowercase();
+    }
+    let hex_only: String = trimmed.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex_only.len() == 32 {
+        return hex_only.to_lowercase();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    digest[..32].to_string()
+}
+
+/// Normalizes any span identifier into a valid 16-character lowercase hexadecimal OpenTelemetry `spanId`.
+pub fn normalize_span_id(input: &str) -> String {
+    let hex_only: String = input.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex_only.len() >= 16 {
+        hex_only[..16].to_lowercase()
+    } else {
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        let digest = hex::encode(hasher.finalize());
+        digest[..16].to_string()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -44,7 +81,7 @@ impl SpanKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_str_lossy(s: &str) -> Self {
         match s {
             "llm" => SpanKind::Llm,
             "policy" => SpanKind::Policy,
@@ -74,7 +111,7 @@ impl SpanStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_str_lossy(s: &str) -> Self {
         match s {
             "in_flight" => SpanStatus::InFlight,
             "error" => SpanStatus::Error,
@@ -102,6 +139,7 @@ pub mod semconv {
     pub const NETWORK_TRANSPORT: &str = "network.transport";
     pub const JSONRPC_REQUEST_ID: &str = "jsonrpc.request.id";
     pub const MCP_TASK_ID: &str = "mcp.task.id";
+    pub const WB_POLICY_CHECKED: &str = "wb.policy_checked";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +168,8 @@ pub struct McpServer {
     pub id: String,
     pub transport: String,
     pub command_or_url: String,
+    #[serde(default)]
+    pub command_argv: Vec<String>,
     pub protocol_versions_seen: Vec<String>,
     pub deprecated_features_seen: Vec<String>,
     pub first_seen: String,
@@ -179,7 +219,7 @@ impl MessageDirection {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_str_lossy(s: &str) -> Self {
         match s {
             "server_to_client" => MessageDirection::ServerToClient,
             _ => MessageDirection::ClientToServer,
@@ -299,6 +339,8 @@ pub enum WorkbenchEvent {
         server_id: String,
         transport: String,
         command_or_url: String,
+        #[serde(default)]
+        command_argv: Vec<String>,
         protocol_version: Option<String>,
         deprecated_feature: Option<String>,
     },
@@ -329,6 +371,7 @@ pub enum WorkbenchEvent {
 /// Wire message sent from `wb wrap` to `wbd` over the local Unix socket / IPC channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "ipc_type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum IpcRequest {
     ObserveEvent {
         event: WorkbenchEvent,
@@ -339,7 +382,12 @@ pub enum IpcRequest {
         server_id: String,
         tool_name: String,
         arguments_raw: String,
+        #[serde(default)]
+        jsonrpc_id: Option<serde_json::Value>,
+        #[serde(default)]
+        raw_request_line: Option<String>,
     },
+    QueryMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +395,8 @@ pub struct IpcResponse {
     pub allowed: bool,
     pub reason: Option<String>,
     pub rule_id: Option<String>,
+    #[serde(default)]
+    pub policy_enabled: bool,
 }
 
 impl PolicyEffect {

@@ -9,8 +9,9 @@ use crate::proxy_stdio::start_ipc_listener;
 use crate::redact::Redactor;
 use crate::store::TraceStore;
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -43,6 +44,36 @@ impl Drop for RunningDaemon {
     }
 }
 
+/// M12: Writes `ui.token` atomically with `0o600` permissions from creation so the token is
+/// never world-readable even momentarily.
+fn write_ui_token_secure(token_path: &Path, ui_token: &str) {
+    if let Some(parent) = token_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = token_path.with_extension(format!("tmp.{}", std::process::id()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+        {
+            if f.write_all(ui_token.as_bytes()).is_ok() && f.sync_all().is_ok() {
+                let _ = std::fs::rename(&tmp_path, token_path);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::write(&tmp_path, ui_token).is_ok() {
+            let _ = std::fs::rename(&tmp_path, token_path);
+        }
+    }
+}
+
 pub async fn start_daemon(
     config: WbConfig,
     allow_non_loopback: bool,
@@ -60,17 +91,23 @@ pub async fn start_daemon(
         config.capture.payloads,
     )?;
 
-    // Pre-populate configured servers in catalog
+    // Pre-populate configured servers in catalog (M5: include command_argv)
     for srv in &config.servers {
         let cmd_or_url = srv
             .upstream
             .clone()
             .or_else(|| srv.command.clone())
             .unwrap_or_default();
+        let mut command_argv = Vec::new();
+        if let Some(ref c) = srv.command {
+            command_argv.push(c.clone());
+            command_argv.extend(srv.args.clone());
+        }
         let _ = store.apply_event(&WorkbenchEvent::ServerObserved {
             server_id: srv.id.clone(),
             transport: srv.transport.clone(),
             command_or_url: cmd_or_url,
+            command_argv,
             protocol_version: None,
             deprecated_feature: None,
         });
@@ -85,26 +122,19 @@ pub async fn start_daemon(
     // 4. Start Unix IPC listener for `wb wrap`
     start_ipc_listener(socket_path.clone(), bus.clone()).await?;
 
+    // H5: Use connect_timeout without a total request timeout so long SSE streams,
+    // slow Tasks, and human elicitation waits are never prematurely terminated by the proxy.
     let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .connect_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
         .build()?;
 
     let config_arc = Arc::new(Mutex::new(config.clone()));
     let ui_token = generate_ui_token();
 
-    // Write UI token to data_dir so local CLI (`wb`) commands can authenticate automatically
+    // Write UI token to data_dir atomically with 0600 permissions (M12)
     let token_path = config.resolve_data_dir().join("ui.token");
-    if let Some(parent) = token_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&token_path, &ui_token);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if token_path.exists() {
-            let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
-        }
-    }
+    write_ui_token_secure(&token_path, &ui_token);
 
     let bind_host = if config.daemon.bind == "localhost" {
         "127.0.0.1"
@@ -124,6 +154,13 @@ pub async fn start_daemon(
 
     let mcp_addr = mcp_listener.local_addr()?;
     let ui_addr = ui_listener.local_addr()?;
+
+    // Update config_arc with actual bound ports in case port 0 was passed
+    {
+        let mut cfg_guard = config_arc.lock().unwrap();
+        cfg_guard.daemon.mcp_port = mcp_addr.port();
+        cfg_guard.daemon.ui_port = ui_addr.port();
+    }
 
     let proxy_router = build_proxy_router(ProxyState {
         config: config_arc.clone(),

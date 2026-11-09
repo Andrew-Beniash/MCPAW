@@ -15,19 +15,25 @@ impl Redactor {
         let mut key_regexes = Vec::new();
         let mut value_regexes = Vec::new();
 
-        // Built-in sensitive key matcher (case-insensitive)
+        // B6: Match key names on fragments rather than exact anchored strings
         if let Ok(re) = Regex::new(
-            r"(?i)^(authorization|proxy-authorization|x-api-key|api[_-]?key|secret|password|passwd|access[_-]?token|refresh[_-]?token|id[_-]?token|private[_-]?key|client[_-]?secret|cookie|set-cookie|canary[_-]?secret)$",
+            r"(?i)(token|secret|passw|api[_-]?key|auth|bearer|credential|private[_-]?key|session[_-]?key|cookie|canary)",
         ) {
             key_regexes.push(re);
         }
 
-        // Built-in value regexes for common inline credentials
+        // B6: Value regexes for well-known token prefixes and serialized key-value credentials
         let builtin_value_patterns = [
             r"sk-[A-Za-z0-9_-]{6,}",
+            r"ghp_[A-Za-z0-9_]{8,}",
+            r"github_pat_[A-Za-z0-9_]{8,}",
+            r"gh[ousr]_[A-Za-z0-9_]{8,}",
+            r"xox[baprs]-[A-Za-z0-9-]{8,}",
+            r"AKIA[0-9A-Z]{16}",
+            r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}",
             r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+",
             r"(?i)basic\s+[A-Za-z0-9+/=]{8,}",
-            r#"(?i)["']?(?:api[_-]?key|secret|password|token|authorization)["']?\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{6,}["']?"#,
+            r#"(?i)["']?[a-z0-9_.-]*(?:token|secret|passw|api[_-]?key|auth|bearer|credential|private[_-]?key|cookie|canary)[a-z0-9_.-]*["']?\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{6,}["']?"#,
         ];
         for pat in builtin_value_patterns {
             if let Ok(re) = Regex::new(pat) {
@@ -36,16 +42,14 @@ impl Redactor {
         }
 
         for pat in patterns {
-            // Compile case-insensitively so patterns like "authorization" or "bearer\\s+\\S+" work seamlessly
             let ci_pat = if pat.starts_with("(?i)") {
                 pat.clone()
             } else {
                 format!("(?i){}", pat)
             };
             if let Ok(re) = Regex::new(&ci_pat) {
-                // If it looks like a key identifier (no whitespace/quantifiers), also use as key matcher
                 if !pat.contains("\\s") && !pat.contains("sk-") {
-                    if let Ok(key_re) = Regex::new(&format!("(?i)^{}$", pat)) {
+                    if let Ok(key_re) = Regex::new(&ci_pat) {
                         key_regexes.push(key_re);
                     }
                 }
@@ -61,6 +65,11 @@ impl Redactor {
     }
 
     pub fn is_sensitive_key(&self, key: &str) -> bool {
+        // Do not treat standard token count metrics (`input_tokens`, `output_tokens`, `cached_tokens`, `total_tokens`) as secrets
+        let lower = key.to_lowercase();
+        if lower.ends_with("_tokens") || lower == "tokens" || lower == "max_run_tokens" {
+            return false;
+        }
         self.key_regexes.iter().any(|re| re.is_match(key))
     }
 
@@ -140,7 +149,21 @@ impl Redactor {
                 ..
             } => {
                 match self.capture_level {
-                    CaptureLevel::Off | CaptureLevel::Metadata => {
+                    CaptureLevel::Off => {
+                        // M13: Under `off`, keep only counts and timing (drop tool names, method names, and message metadata)
+                        span.name = span.kind.as_str().to_string();
+                        span.attributes.clear();
+                        for msg in mcp_messages.iter_mut() {
+                            msg.payload = None;
+                            msg.method = None;
+                            msg.jsonrpc_id = None;
+                        }
+                        if let Some(mc) = model_call.as_mut() {
+                            mc.request_payload = None;
+                            mc.response_payload = None;
+                        }
+                    }
+                    CaptureLevel::Metadata => {
                         span.attributes.remove(semconv::GEN_AI_TOOL_CALL_ARGUMENTS);
                         span.attributes.remove(semconv::GEN_AI_TOOL_CALL_RESULT);
                         for (_, v) in span.attributes.iter_mut() {
@@ -183,7 +206,15 @@ impl Redactor {
                 ..
             } => {
                 match self.capture_level {
-                    CaptureLevel::Off | CaptureLevel::Metadata => {
+                    CaptureLevel::Off => {
+                        attributes_patch.clear();
+                        if let Some(msg) = response_message.as_mut() {
+                            msg.payload = None;
+                            msg.method = None;
+                            msg.jsonrpc_id = None;
+                        }
+                    }
+                    CaptureLevel::Metadata => {
                         attributes_patch.remove(semconv::GEN_AI_TOOL_CALL_ARGUMENTS);
                         attributes_patch.remove(semconv::GEN_AI_TOOL_CALL_RESULT);
                         for (_, v) in attributes_patch.iter_mut() {

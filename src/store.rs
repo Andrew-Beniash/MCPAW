@@ -14,7 +14,8 @@ const BLOB_THRESHOLD_BYTES: usize = 64 * 1024; // 64 KB (§4.1)
 #[derive(Clone)]
 pub struct TraceStore {
     db_path: PathBuf,
-    conn: Arc<Mutex<Connection>>,
+    write_conn: Arc<Mutex<Connection>>,
+    read_conn: Arc<Mutex<Connection>>,
     idle_run_gap_secs: u64,
     capture_level: CaptureLevel,
 }
@@ -28,7 +29,7 @@ impl TraceStore {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(db_path)
+        let write_conn = Connection::open(db_path)
             .with_context(|| format!("failed to open SQLite trace store at {}", db_path.display()))?;
 
         // Enforce 0600 file permissions on Unix (§8 Threat Model)
@@ -40,11 +41,13 @@ impl TraceStore {
             }
         }
 
-        conn.execute_batch(
+        write_conn.execute_batch(
             r#"
+            PRAGMA auto_vacuum = INCREMENTAL;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
+            PRAGMA busy_timeout = 5000;
             PRAGMA temp_store = MEMORY;
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -90,6 +93,7 @@ impl TraceStore {
                 id TEXT PRIMARY KEY,
                 transport TEXT NOT NULL,
                 command_or_url TEXT NOT NULL,
+                command_argv_json TEXT NOT NULL DEFAULT '[]',
                 protocol_versions_json TEXT NOT NULL DEFAULT '[]',
                 deprecated_features_json TEXT NOT NULL DEFAULT '[]',
                 first_seen TEXT NOT NULL,
@@ -181,9 +185,22 @@ impl TraceStore {
             "#,
         )?;
 
+        // Ensure `command_argv_json` column exists on existing databases
+        let _ = write_conn.execute(
+            "ALTER TABLE mcp_servers ADD COLUMN command_argv_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+
+        // Open a separate read connection (M1) so readers don't contend on the writer mutex
+        let read_conn = Connection::open(db_path)?;
+        read_conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;",
+        )?;
+
         Ok(Self {
             db_path: db_path.to_path_buf(),
-            conn: Arc::new(Mutex::new(conn)),
+            write_conn: Arc::new(Mutex::new(write_conn)),
+            read_conn: Arc::new(Mutex::new(read_conn)),
             idle_run_gap_secs,
             capture_level,
         })
@@ -242,8 +259,7 @@ impl TraceStore {
         None
     }
 
-    /// Resolves or creates the active `Run` for a session, inferring a new run if
-    /// the idle gap exceeds `idle_run_gap_secs` (§5).
+    /// Resolves or creates the active `Run`, linking activity within `idle_run_gap_secs` (§5, H2).
     fn resolve_or_create_run(
         tx: &rusqlite::Transaction<'_>,
         session_id: &str,
@@ -267,14 +283,24 @@ impl TraceStore {
             return Ok(explicit_run_id.to_string());
         }
 
-        // Check latest run for this session
+        // Check latest run for this session (or across active sessions within idle_run_gap_secs)
         let latest: Option<(String, i64)> = tx
             .query_row(
                 "SELECT id, last_activity_ns FROM runs WHERE session_id = ?1 ORDER BY last_activity_ns DESC LIMIT 1",
                 params![session_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?;
+            .optional()?
+            .or_else(|| {
+                tx.query_row(
+                    "SELECT id, last_activity_ns FROM runs ORDER BY last_activity_ns DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            });
 
         let gap_ns = idle_run_gap_secs.saturating_mul(1_000_000_000);
         if let Some((run_id, last_ns)) = latest {
@@ -301,7 +327,7 @@ impl TraceStore {
         if events.is_empty() {
             return Ok(());
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         for ev in events {
@@ -329,24 +355,30 @@ impl TraceStore {
                     server_id,
                     transport,
                     command_or_url,
+                    command_argv,
                     protocol_version,
                     deprecated_feature,
                 } => {
                     let now = Utc::now().to_rfc3339();
-                    let existing: Option<(String, String)> = tx
+                    let existing: Option<(String, String, String)> = tx
                         .query_row(
-                            "SELECT protocol_versions_json, deprecated_features_json FROM mcp_servers WHERE id = ?1",
+                            "SELECT protocol_versions_json, deprecated_features_json, command_argv_json FROM mcp_servers WHERE id = ?1",
                             params![server_id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
                         .optional()?;
 
-                    let (mut versions, mut deprecated): (Vec<String>, Vec<String>) = match existing {
-                        Some((v_json, d_json)) => (
+                    let (mut versions, mut deprecated, existing_argv): (
+                        Vec<String>,
+                        Vec<String>,
+                        Vec<String>,
+                    ) = match existing {
+                        Some((v_json, d_json, a_json)) => (
                             serde_json::from_str(&v_json).unwrap_or_default(),
                             serde_json::from_str(&d_json).unwrap_or_default(),
+                            serde_json::from_str(&a_json).unwrap_or_default(),
                         ),
-                        None => (Vec::new(), Vec::new()),
+                        None => (Vec::new(), Vec::new(), Vec::new()),
                     };
 
                     if let Some(ver) = protocol_version {
@@ -360,19 +392,27 @@ impl TraceStore {
                         }
                     }
 
+                    let argv_to_store = if !command_argv.is_empty() {
+                        command_argv
+                    } else {
+                        &existing_argv
+                    };
+
                     let v_str = serde_json::to_string(&versions)?;
                     let d_str = serde_json::to_string(&deprecated)?;
+                    let a_str = serde_json::to_string(argv_to_store)?;
 
                     tx.execute(
-                        "INSERT INTO mcp_servers (id, transport, command_or_url, protocol_versions_json, deprecated_features_json, first_seen, last_seen)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                        "INSERT INTO mcp_servers (id, transport, command_or_url, command_argv_json, protocol_versions_json, deprecated_features_json, first_seen, last_seen)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
                          ON CONFLICT(id) DO UPDATE SET
                            transport = excluded.transport,
                            command_or_url = CASE WHEN excluded.command_or_url != '' THEN excluded.command_or_url ELSE mcp_servers.command_or_url END,
+                           command_argv_json = CASE WHEN excluded.command_argv_json != '[]' THEN excluded.command_argv_json ELSE mcp_servers.command_argv_json END,
                            protocol_versions_json = excluded.protocol_versions_json,
                            deprecated_features_json = excluded.deprecated_features_json,
                            last_seen = excluded.last_seen",
-                        params![server_id, transport, command_or_url, v_str, d_str, now],
+                        params![server_id, transport, command_or_url, a_str, v_str, d_str, now],
                     )?;
                 }
                 WorkbenchEvent::ToolsDiscovered { server_id, tools } => {
@@ -492,14 +532,18 @@ impl TraceStore {
                         serde_json::to_string(&span.attributes)?
                     };
 
+                    let norm_trace_id = normalize_trace_id(&span.trace_id);
+                    let norm_span_id = normalize_span_id(&span.id);
+                    let norm_parent_id = span.parent_id.as_deref().map(normalize_span_id);
+
                     tx.execute(
                         "INSERT OR REPLACE INTO spans (id, trace_id, run_id, parent_id, kind, name, start_ns, end_ns, status, attributes_json)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         params![
-                            span.id,
-                            span.trace_id,
+                            norm_span_id,
+                            norm_trace_id,
                             run_id,
-                            span.parent_id,
+                            norm_parent_id,
                             span.kind.as_str(),
                             span.name,
                             span.start_ns as i64,
@@ -536,13 +580,18 @@ impl TraceStore {
                         } else {
                             msg.method.clone()
                         };
+                        let id_col = if self.capture_level == CaptureLevel::Off {
+                            None
+                        } else {
+                            msg.jsonrpc_id.clone()
+                        };
                         tx.execute(
                             "INSERT INTO mcp_messages (span_id, direction, jsonrpc_id, method, payload_ref, inline_payload, bytes, timestamp_ns)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                             params![
-                                span.id,
+                                norm_span_id,
                                 msg.direction.as_str(),
-                                msg.jsonrpc_id,
+                                id_col,
                                 method_col,
                                 payload_ref,
                                 inline_payload,
@@ -699,27 +748,29 @@ impl TraceStore {
     }
 
     pub fn list_servers(&self) -> Result<Vec<McpServer>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT s.id, s.transport, s.command_or_url, s.protocol_versions_json, s.deprecated_features_json, s.first_seen, s.last_seen,
+            "SELECT s.id, s.transport, s.command_or_url, s.command_argv_json, s.protocol_versions_json, s.deprecated_features_json, s.first_seen, s.last_seen,
                     (SELECT COUNT(*) FROM tool_definitions t WHERE t.server_id = s.id) as tool_count,
                     (SELECT COALESCE(SUM(changed_count), 0) FROM tool_definitions t WHERE t.server_id = s.id) as schema_changes
              FROM mcp_servers s
              ORDER BY s.id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
-            let v_json: String = row.get(3)?;
-            let d_json: String = row.get(4)?;
+            let a_json: String = row.get(3)?;
+            let v_json: String = row.get(4)?;
+            let d_json: String = row.get(5)?;
             Ok(McpServer {
                 id: row.get(0)?,
                 transport: row.get(1)?,
                 command_or_url: row.get(2)?,
+                command_argv: serde_json::from_str(&a_json).unwrap_or_default(),
                 protocol_versions_seen: serde_json::from_str(&v_json).unwrap_or_default(),
                 deprecated_features_seen: serde_json::from_str(&d_json).unwrap_or_default(),
-                first_seen: row.get(5)?,
-                last_seen: row.get(6)?,
-                tool_count: row.get::<_, i64>(7)? as usize,
-                schema_changes: row.get::<_, i64>(8)? as usize,
+                first_seen: row.get(6)?,
+                last_seen: row.get(7)?,
+                tool_count: row.get::<_, i64>(8)? as usize,
+                schema_changes: row.get::<_, i64>(9)? as usize,
             })
         })?;
         let mut out = Vec::new();
@@ -730,7 +781,7 @@ impl TraceStore {
     }
 
     pub fn get_server_tools(&self, server_id: &str) -> Result<Vec<ToolDefinition>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT server_id, name, description, input_schema_json, schema_hash, first_seen, last_seen, changed_count, previous_description, previous_schema_hash, poison_warnings_json
              FROM tool_definitions
@@ -766,7 +817,7 @@ impl TraceStore {
         server_id: &str,
         tool_name: Option<&str>,
     ) -> Result<Vec<ToolSchemaChange>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut out = Vec::new();
         if let Some(name) = tool_name {
             let mut stmt = conn.prepare(
@@ -813,7 +864,7 @@ impl TraceStore {
     }
 
     pub fn list_runs(&self, since: Option<&str>, status: Option<&str>) -> Result<Vec<Run>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT r.id, r.session_id, r.label, r.status, r.started_at, r.ended_at, r.total_cost_usd, r.total_tokens, r.estimated_cost,
                     (SELECT COUNT(*) FROM spans s WHERE s.run_id = r.id) as span_count,
@@ -846,7 +897,7 @@ impl TraceStore {
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<Run>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let run = conn
             .query_row(
                 "SELECT r.id, r.session_id, r.label, r.status, r.started_at, r.ended_at, r.total_cost_usd, r.total_tokens, r.estimated_cost,
@@ -876,7 +927,7 @@ impl TraceStore {
     }
 
     pub fn get_run_spans(&self, run_id: &str) -> Result<Vec<Span>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, trace_id, run_id, parent_id, kind, name, start_ns, end_ns, status, attributes_json
              FROM spans
@@ -892,11 +943,11 @@ impl TraceStore {
                 trace_id: row.get(1)?,
                 run_id: row.get(2)?,
                 parent_id: row.get(3)?,
-                kind: SpanKind::from_str(&kind_str),
+                kind: SpanKind::from_str_lossy(&kind_str),
                 name: row.get(5)?,
                 start_ns: row.get::<_, i64>(6)? as u64,
                 end_ns: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                status: SpanStatus::from_str(&status_str),
+                status: SpanStatus::from_str_lossy(&status_str),
                 attributes: serde_json::from_str(&attr_str).unwrap_or_default(),
             })
         })?;
@@ -908,7 +959,7 @@ impl TraceStore {
     }
 
     pub fn get_span_detail(&self, span_id: &str) -> Result<Option<SpanDetail>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let Some(span) = conn
             .query_row(
                 "SELECT id, trace_id, run_id, parent_id, kind, name, start_ns, end_ns, status, attributes_json
@@ -923,11 +974,11 @@ impl TraceStore {
                         trace_id: row.get(1)?,
                         run_id: row.get(2)?,
                         parent_id: row.get(3)?,
-                        kind: SpanKind::from_str(&kind_str),
+                        kind: SpanKind::from_str_lossy(&kind_str),
                         name: row.get(5)?,
                         start_ns: row.get::<_, i64>(6)? as u64,
                         end_ns: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
-                        status: SpanStatus::from_str(&status_str),
+                        status: SpanStatus::from_str_lossy(&status_str),
                         attributes: serde_json::from_str(&attr_str).unwrap_or_default(),
                     })
                 },
@@ -937,7 +988,6 @@ impl TraceStore {
             return Ok(None);
         };
 
-        // Load MCP messages
         let mut msg_stmt = conn.prepare(
             "SELECT id, span_id, direction, jsonrpc_id, method, payload_ref, inline_payload, bytes, timestamp_ns
              FROM mcp_messages WHERE span_id = ?1 ORDER BY timestamp_ns ASC, id ASC",
@@ -949,7 +999,7 @@ impl TraceStore {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
-                MessageDirection::from_str(&dir_str),
+                MessageDirection::from_str_lossy(&dir_str),
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 p_ref,
@@ -974,7 +1024,6 @@ impl TraceStore {
             });
         }
 
-        // Load ModelCall if present
         let model_call_raw = conn
             .query_row(
                 "SELECT provider, model, input_tokens, output_tokens, cached_tokens, cost_usd, cost_estimated, finish_reason, context_breakdown_json, request_payload_ref, request_inline, response_payload_ref, response_inline
@@ -1035,7 +1084,6 @@ impl TraceStore {
             },
         );
 
-        // Load policy decisions
         let mut pd_stmt = conn.prepare(
             "SELECT id, rule_id, span_id, server_id, tool_name, verdict, reason, timestamp_ns
              FROM policy_decisions WHERE span_id = ?1 ORDER BY id ASC",
@@ -1057,7 +1105,6 @@ impl TraceStore {
             policy_decisions.push(pr?);
         }
 
-        // Load annotations
         let mut ann_stmt = conn.prepare(
             "SELECT id, target_id, author, text, created_at FROM annotations WHERE target_id = ?1 ORDER BY id ASC",
         )?;
@@ -1100,7 +1147,7 @@ impl TraceStore {
     }
 
     pub fn add_annotation(&self, target_id: &str, author: &str, text: &str) -> Result<Annotation> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.write_conn.lock().unwrap();
         let created_at = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO annotations (target_id, author, text, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -1117,7 +1164,7 @@ impl TraceStore {
     }
 
     pub fn list_annotations(&self, target_id: &str) -> Result<Vec<Annotation>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, target_id, author, text, created_at FROM annotations WHERE target_id = ?1 ORDER BY id ASC",
         )?;
@@ -1138,7 +1185,7 @@ impl TraceStore {
     }
 
     pub fn list_policy_decisions(&self, limit: usize) -> Result<Vec<PolicyDecision>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.read_conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, rule_id, span_id, server_id, tool_name, verdict, reason, timestamp_ns
              FROM policy_decisions ORDER BY id DESC LIMIT ?1",
@@ -1293,7 +1340,7 @@ impl TraceStore {
     /// Imports a JSONL export into the local trace store (UC-10).
     pub fn import_jsonl(&self, jsonl_content: &str) -> Result<usize> {
         let mut imported_runs = 0;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         for line in jsonl_content.lines() {
@@ -1330,12 +1377,13 @@ impl TraceStore {
                     let detail: SpanDetail = serde_json::from_value(val["detail"].clone())?;
                     let sp = detail.span;
                     let attr_str = serde_json::to_string(&sp.attributes)?;
+                    let norm_trace = normalize_trace_id(&sp.trace_id);
                     tx.execute(
                         "INSERT OR REPLACE INTO spans (id, trace_id, run_id, parent_id, kind, name, start_ns, end_ns, status, attributes_json)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                         params![
                             sp.id,
-                            sp.trace_id,
+                            norm_trace,
                             sp.run_id,
                             sp.parent_id,
                             sp.kind.as_str(),
@@ -1418,12 +1466,12 @@ impl TraceStore {
         for run in target_runs {
             let spans = self.get_run_spans(&run.id)?;
             for sp in spans {
-                let trace_id_hex = normalize_hex_id(&sp.trace_id, 32);
-                let span_id_hex = normalize_hex_id(&sp.id, 16);
+                let trace_id_hex = normalize_trace_id(&sp.trace_id);
+                let span_id_hex = normalize_span_id(&sp.id);
                 let parent_id_hex = sp
                     .parent_id
                     .as_deref()
-                    .map(|p| normalize_hex_id(p, 16))
+                    .map(normalize_span_id)
                     .unwrap_or_default();
 
                 let mut attributes = vec![
@@ -1570,7 +1618,7 @@ impl TraceStore {
             return Ok(0);
         };
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn.lock().unwrap();
         let tx = conn.transaction()?;
 
         for rs in resource_spans {
@@ -1582,11 +1630,11 @@ impl TraceStore {
                     continue;
                 };
                 for sp in spans {
-                    let trace_id = sp
+                    let raw_trace_id = sp
                         .get("traceId")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("external-trace")
-                        .to_string();
+                        .unwrap_or("external-trace");
+                    let trace_id = normalize_trace_id(raw_trace_id);
                     let span_id = sp
                         .get("spanId")
                         .and_then(|v| v.as_str())
@@ -1616,7 +1664,6 @@ impl TraceStore {
                             .or_else(|| v.as_u64())
                     });
 
-                    // Join with an existing run that shares `trace_id`, or create an external run
                     let matched_run: Option<String> = tx
                         .query_row(
                             "SELECT run_id FROM spans WHERE trace_id = ?1 LIMIT 1",
@@ -1680,16 +1727,15 @@ impl TraceStore {
     }
 
     /// Enforces retention age (`retention_days`) and size (`max_db_mb`) caps;
-    /// oldest runs are evicted first (N-09).
+    /// oldest runs, their blobs, and their annotations are evicted first, followed by incremental vacuum (N-09, M4).
     pub fn enforce_retention(&self, retention_days: u32, max_db_mb: u64) -> Result<usize> {
         let mut evicted = 0;
         let cutoff: DateTime<Utc> = Utc::now() - Duration::days(retention_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.write_conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        // 1. Evict runs older than retention_days
         let old_run_ids: Vec<String> = {
             let mut stmt = tx.prepare("SELECT id FROM runs WHERE started_at < ?1")?;
             let rows = stmt.query_map(params![cutoff_str], |row| row.get(0))?;
@@ -1703,7 +1749,6 @@ impl TraceStore {
 
         tx.commit()?;
 
-        // 2. Check database file size against max_db_mb
         let max_bytes = max_db_mb.saturating_mul(1024 * 1024);
         if let Ok(meta) = std::fs::metadata(&self.db_path) {
             if meta.len() > max_bytes {
@@ -1722,10 +1767,30 @@ impl TraceStore {
             }
         }
 
+        if evicted > 0 {
+            let _ = conn.execute_batch("PRAGMA incremental_vacuum;");
+        }
+
         Ok(evicted)
     }
 
     fn delete_run_cascade(tx: &rusqlite::Transaction<'_>, run_id: &str) -> Result<()> {
+        // M4: Delete blobs referenced by mcp_messages or model_calls in this run
+        tx.execute(
+            "DELETE FROM blobs WHERE id IN (
+                SELECT payload_ref FROM mcp_messages WHERE payload_ref IS NOT NULL AND span_id IN (SELECT id FROM spans WHERE run_id = ?1)
+                UNION
+                SELECT request_payload_ref FROM model_calls WHERE request_payload_ref IS NOT NULL AND span_id IN (SELECT id FROM spans WHERE run_id = ?1)
+                UNION
+                SELECT response_payload_ref FROM model_calls WHERE response_payload_ref IS NOT NULL AND span_id IN (SELECT id FROM spans WHERE run_id = ?1)
+            )",
+            params![run_id],
+        )?;
+        // M4: Delete annotations attached to the run or any span in the run
+        tx.execute(
+            "DELETE FROM annotations WHERE target_id = ?1 OR target_id IN (SELECT id FROM spans WHERE run_id = ?1)",
+            params![run_id],
+        )?;
         tx.execute(
             "DELETE FROM mcp_messages WHERE span_id IN (SELECT id FROM spans WHERE run_id = ?1)",
             params![run_id],
@@ -1741,14 +1806,5 @@ impl TraceStore {
         tx.execute("DELETE FROM spans WHERE run_id = ?1", params![run_id])?;
         tx.execute("DELETE FROM runs WHERE id = ?1", params![run_id])?;
         Ok(())
-    }
-}
-
-fn normalize_hex_id(input: &str, len: usize) -> String {
-    let hex_chars: String = input.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if hex_chars.len() >= len {
-        hex_chars[..len].to_lowercase()
-    } else {
-        format!("{:0>width$}", hex_chars.to_lowercase(), width = len)
     }
 }

@@ -1,20 +1,18 @@
 use anyhow::{bail, Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CaptureLevel {
     Off,
+    #[default]
     Metadata,
     Full,
-}
-
-impl Default for CaptureLevel {
-    fn default() -> Self {
-        CaptureLevel::Metadata
-    }
 }
 
 impl std::fmt::Display for CaptureLevel {
@@ -45,6 +43,12 @@ pub struct DaemonConfig {
     pub llm_upstream: Option<String>,
     #[serde(default)]
     pub anthropic_upstream: Option<String>,
+    /// Enables developer/testing features (such as fake LLM scenarios and allowlisted test upstreams)
+    #[serde(default)]
+    pub dev_mode: bool,
+    /// Optional bearer token required on proxy port (:7410) HTTP requests
+    #[serde(default)]
+    pub proxy_token: Option<String>,
 }
 
 fn default_mcp_port() -> u16 {
@@ -71,6 +75,8 @@ impl Default for DaemonConfig {
             socket_path: None,
             llm_upstream: None,
             anthropic_upstream: None,
+            dev_mode: false,
+            proxy_token: None,
         }
     }
 }
@@ -163,18 +169,10 @@ impl Default for PricingConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExportConfig {
     #[serde(default)]
     pub otlp_endpoint: String,
-}
-
-impl Default for ExportConfig {
-    fn default() -> Self {
-        Self {
-            otlp_endpoint: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +236,22 @@ fn default_wildcard() -> String {
     "*".to_string()
 }
 
+impl PolicyRule {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(ref pat) = self.arg_pattern {
+            if !pat.is_empty() {
+                Regex::new(pat).with_context(|| {
+                    format!(
+                        "Invalid regex in policy rule '{}' arg_pattern: '{}'",
+                        self.id, pat
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
     #[serde(default)]
@@ -277,6 +291,8 @@ pub struct WbConfig {
     pub breaker: BreakerConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(skip)]
+    pub loaded_from: Option<PathBuf>,
 }
 
 impl WbConfig {
@@ -293,12 +309,40 @@ impl WbConfig {
             if p.exists() {
                 let raw = std::fs::read_to_string(&p)
                     .with_context(|| format!("failed to read config at {}", p.display()))?;
-                let cfg: WbConfig = toml::from_str(&raw)
+                let mut cfg: WbConfig = toml::from_str(&raw)
                     .with_context(|| format!("failed to parse TOML config at {}", p.display()))?;
+                cfg.validate_policy_rules()?;
+                cfg.loaded_from = Some(p);
                 return Ok(cfg);
             }
         }
         Ok(WbConfig::default())
+    }
+
+    pub fn validate_policy_rules(&self) -> Result<()> {
+        for rule in &self.policy.rules {
+            rule.validate()?;
+        }
+        Ok(())
+    }
+
+    /// Atomically persists the configuration to `wb.toml` via a temporary file rename (H3).
+    pub fn save_atomic(&self) -> Result<()> {
+        let target = self
+            .loaded_from
+            .clone()
+            .or_else(Self::default_config_path);
+        let Some(path) = target else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let serialized = toml::to_string_pretty(self)?;
+        let tmp_path = path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, serialized)?;
+        std::fs::rename(&tmp_path, &path)?;
+        Ok(())
     }
 
     pub fn default_config_path() -> Option<PathBuf> {
@@ -355,88 +399,182 @@ impl WbConfig {
     }
 }
 
-/// Rewrites a client MCP config JSON (such as Claude Code or Claude Desktop)
-/// to wrap each stdio server with `wb wrap --id <id> -- <command> <args...>`,
-/// saving a `.wb-backup` file alongside it for one-command undo.
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupMetadata {
+    pub backup_file: PathBuf,
+    pub wrapped_sha256: String,
+    pub created_at_unix: u64,
+}
+
+fn sha256_str(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn wrap_mcp_servers_map(
+    servers: &mut serde_json::Map<String, serde_json::Value>,
+    wb_bin: &str,
+    wrapped_servers: &mut Vec<String>,
+) {
+    for (server_id, entry) in servers.iter_mut() {
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        let Some(cmd) = obj.get("command").and_then(|c| c.as_str()).map(String::from) else {
+            continue;
+        };
+        let existing_args: Vec<String> = obj
+            .get("args")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Skip if already wrapped
+        if (cmd == "wb" || cmd.ends_with("/wb"))
+            && existing_args.first().map(|s| s.as_str()) == Some("wrap")
+        {
+            continue;
+        }
+
+        let mut new_args = vec![
+            "wrap".to_string(),
+            "--id".to_string(),
+            server_id.clone(),
+            "--".to_string(),
+            cmd,
+        ];
+        new_args.extend(existing_args);
+
+        obj.insert(
+            "command".to_string(),
+            serde_json::Value::String(wb_bin.to_string()),
+        );
+        obj.insert(
+            "args".to_string(),
+            serde_json::Value::Array(
+                new_args
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+        wrapped_servers.push(server_id.clone());
+    }
+}
+
+/// Safe, atomic client configuration rewriter (`wb setup claude-code`, H9):
+/// - Preserves JSON key order (`serde_json/preserve_order`)
+/// - Handles both top-level `mcpServers` and project-scoped `projects.<path>.mcpServers`
+/// - Uses timestamped backups + hash check so `--undo` refuses to clobber subsequent edits
+/// - Refuses to overwrite if the file changed on disk since read, and writes via atomic rename
 pub fn setup_client_config(
     config_path: &Path,
     wb_bin: &str,
     undo: bool,
 ) -> Result<Vec<String>> {
-    let backup_path = config_path.with_extension("json.wb-backup");
+    let meta_path = config_path.with_extension("json.wb-backup-meta");
+    let legacy_backup_path = config_path.with_extension("json.wb-backup");
 
     if undo {
-        if !backup_path.exists() {
-            bail!("No backup file found at {}", backup_path.display());
+        let current_raw = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read {}", config_path.display()))?;
+        let current_hash = sha256_str(&current_raw);
+
+        if meta_path.exists() {
+            let meta_raw = std::fs::read_to_string(&meta_path)?;
+            let meta: BackupMetadata = serde_json::from_str(&meta_raw)?;
+            if meta.wrapped_sha256 != current_hash {
+                bail!(
+                    "Refusing to restore backup because {} was modified after `wb setup` ran. \
+                     Inspect the backup manually at {}.",
+                    config_path.display(),
+                    meta.backup_file.display()
+                );
+            }
+            if !meta.backup_file.exists() {
+                bail!("Backup file missing at {}", meta.backup_file.display());
+            }
+            let tmp_restore = config_path.with_extension("json.wb-tmp");
+            std::fs::copy(&meta.backup_file, &tmp_restore)?;
+            std::fs::rename(&tmp_restore, config_path)?;
+            let _ = std::fs::remove_file(&meta.backup_file);
+            let _ = std::fs::remove_file(&meta_path);
+            let _ = std::fs::remove_file(&legacy_backup_path);
+            return Ok(vec!["Restored original configuration from backup.".to_string()]);
+        } else if legacy_backup_path.exists() {
+            let tmp_restore = config_path.with_extension("json.wb-tmp");
+            std::fs::copy(&legacy_backup_path, &tmp_restore)?;
+            std::fs::rename(&tmp_restore, config_path)?;
+            let _ = std::fs::remove_file(&legacy_backup_path);
+            return Ok(vec!["Restored original configuration from backup.".to_string()]);
+        } else {
+            bail!("No backup file found for {}", config_path.display());
         }
-        std::fs::copy(&backup_path, config_path)?;
-        std::fs::remove_file(&backup_path)?;
-        return Ok(vec!["Restored original configuration from backup.".to_string()]);
     }
 
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read client config at {}", config_path.display()))?;
+    let initial_hash = sha256_str(&raw);
+
     let mut root: serde_json::Value =
         serde_json::from_str(&raw).context("Client config is not valid JSON")?;
 
-    if !backup_path.exists() {
-        std::fs::write(&backup_path, &raw)
-            .with_context(|| format!("Failed to write backup at {}", backup_path.display()))?;
+    let mut wrapped_servers = Vec::new();
+
+    // 1. Top-level `mcpServers`
+    if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
+        wrap_mcp_servers_map(servers, wb_bin, &mut wrapped_servers);
     }
 
-    let mut wrapped_servers = Vec::new();
-    if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut()) {
-        for (server_id, entry) in servers.iter_mut() {
-            let Some(obj) = entry.as_object_mut() else {
-                continue;
-            };
-            let Some(cmd) = obj.get("command").and_then(|c| c.as_str()).map(String::from) else {
-                continue;
-            };
-            let existing_args: Vec<String> = obj
-                .get("args")
-                .and_then(|a| a.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Skip if already wrapped
-            if (cmd == "wb" || cmd.ends_with("/wb"))
-                && existing_args.first().map(|s| s.as_str()) == Some("wrap")
+    // 2. Project-scoped `projects.<path>.mcpServers` (Claude Code ~/.claude.json structure)
+    if let Some(projects) = root.get_mut("projects").and_then(|v| v.as_object_mut()) {
+        for (_proj_path, proj_val) in projects.iter_mut() {
+            if let Some(servers) = proj_val
+                .get_mut("mcpServers")
+                .and_then(|v| v.as_object_mut())
             {
-                continue;
+                wrap_mcp_servers_map(servers, wb_bin, &mut wrapped_servers);
             }
-
-            let mut new_args = vec![
-                "wrap".to_string(),
-                "--id".to_string(),
-                server_id.clone(),
-                "--".to_string(),
-                cmd,
-            ];
-            new_args.extend(existing_args);
-
-            obj.insert(
-                "command".to_string(),
-                serde_json::Value::String(wb_bin.to_string()),
-            );
-            obj.insert(
-                "args".to_string(),
-                serde_json::Value::Array(
-                    new_args
-                        .into_iter()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-            wrapped_servers.push(server_id.clone());
         }
     }
 
+    // Verify the file was not modified concurrently by the client while we processed it
+    let verify_raw = std::fs::read_to_string(config_path)?;
+    if sha256_str(&verify_raw) != initial_hash {
+        bail!(
+            "Client config at {} changed on disk during setup; aborting to prevent data loss.",
+            config_path.display()
+        );
+    }
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts_backup_path = config_path.with_extension(format!("json.wb-backup.{}", ts));
+    std::fs::write(&ts_backup_path, &raw)
+        .with_context(|| format!("Failed to write backup at {}", ts_backup_path.display()))?;
+    // Also maintain `.wb-backup` symlink/copy for compatibility
+    let _ = std::fs::write(&legacy_backup_path, &raw);
+
     let formatted = serde_json::to_string_pretty(&root)?;
-    std::fs::write(config_path, formatted)?;
+    let wrapped_hash = sha256_str(&formatted);
+
+    let tmp_path = config_path.with_extension("json.wb-tmp");
+    std::fs::write(&tmp_path, &formatted)?;
+    std::fs::rename(&tmp_path, config_path)?;
+
+    let meta = BackupMetadata {
+        backup_file: ts_backup_path,
+        wrapped_sha256: wrapped_hash,
+        created_at_unix: ts,
+    };
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+
     Ok(wrapped_servers)
 }

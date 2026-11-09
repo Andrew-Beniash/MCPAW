@@ -214,6 +214,41 @@ pub fn run_stdio_fixture(kind: &str) -> Result<i32> {
                             "result": { "action": "approved", "data": { "confirmed": true } }
                         })
                     }
+                    "tools/call"
+                        if params.get("name").and_then(|n| n.as_str()) == Some("ask_human") =>
+                    {
+                        // H7: Server-initiated `elicitation/create` request sent to the client
+                        let srv_req = json!({
+                            "jsonrpc": "2.0",
+                            "id": "srv-elic-1",
+                            "method": "elicitation/create",
+                            "params": {
+                                "message": "Approve payment of $500?"
+                            }
+                        });
+                        write!(writer, "{}{}", serde_json::to_string(&srv_req)?, line_ending)?;
+                        writer.flush()?;
+
+                        // Wait for client's JSON-RPC response to `srv-elic-1`
+                        let mut client_resp_buf = Vec::new();
+                        let _ = reader.read_until(b'\n', &mut client_resp_buf)?;
+                        let client_resp_str =
+                            String::from_utf8_lossy(&client_resp_buf).trim().to_string();
+                        let client_resp_val: Value =
+                            serde_json::from_str(&client_resp_str).unwrap_or_else(|_| json!({}));
+
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{
+                                    "type": "text",
+                                    "text": "Human approval received"
+                                }],
+                                "client_response": client_resp_val.get("result").cloned().unwrap_or(json!(null))
+                            }
+                        })
+                    }
                     _ => json!({
                         "jsonrpc": "2.0",
                         "id": id,

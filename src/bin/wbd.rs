@@ -30,6 +30,10 @@ struct WbdArgs {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
+    /// Enable development mode (allows header-chosen upstreams and fake LLM endpoints)
+    #[arg(long, default_value_t = false)]
+    dev: bool,
+
     /// Required flag to allow binding to non-loopback addresses such as 0.0.0.0
     #[arg(long = "i-understand-this-exposes-traffic", default_value_t = false)]
     allow_non_loopback: bool,
@@ -58,6 +62,9 @@ async fn main() -> Result<()> {
     }
     if let Some(dd) = args.data_dir {
         cfg.daemon.data_dir = Some(dd);
+    }
+    if args.dev {
+        cfg.daemon.dev_mode = true;
     }
 
     let daemon = start_daemon(cfg, args.allow_non_loopback).await?;
