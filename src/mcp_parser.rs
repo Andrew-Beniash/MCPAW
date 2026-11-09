@@ -63,7 +63,7 @@ pub fn canonicalize_json(val: &Value) -> String {
     match val {
         Value::Object(map) => {
             let mut sorted: Vec<(&String, &Value)> = map.iter().collect();
-            sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+            sorted.sort_by_key(|(a, _)| *a);
             let inner: Vec<String> = sorted
                 .into_iter()
                 .map(|(k, v)| {
@@ -214,7 +214,12 @@ pub fn parse_mcp_payload(
     let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
         return ParsedMcpFrame::Malformed;
     };
-    parse_mcp_value(&val, server_id, header_protocol_version, session_has_initialize)
+    parse_mcp_value(
+        &val,
+        server_id,
+        header_protocol_version,
+        session_has_initialize,
+    )
 }
 
 /// Canonicalizes a JSON-RPC `id` so string `"1"` (`"\"1\""`) and integer `1` (`"1"`) remain distinct (M7).
@@ -281,7 +286,14 @@ pub fn parse_mcp_value(
     if let Value::Array(arr) = val {
         let items = arr
             .iter()
-            .map(|v| parse_mcp_value(v, server_id, header_protocol_version, session_has_initialize))
+            .map(|v| {
+                parse_mcp_value(
+                    v,
+                    server_id,
+                    header_protocol_version,
+                    session_has_initialize,
+                )
+            })
             .collect();
         return ParsedMcpFrame::Batch(items);
     }
@@ -295,7 +307,9 @@ pub fn parse_mcp_value(
     let params = obj.get("params");
 
     // H8: Read `io.modelcontextprotocol/protocolVersion` as well as `protocolVersion` / `mcpProtocolVersion` in `_meta`
-    let meta = params.and_then(|p| p.get("_meta")).and_then(|m| m.as_object());
+    let meta = params
+        .and_then(|p| p.get("_meta"))
+        .and_then(|m| m.as_object());
     let meta_version = meta
         .and_then(|m| {
             m.get("io.modelcontextprotocol/protocolVersion")
@@ -339,7 +353,8 @@ pub fn parse_mcp_value(
                     tool_name = p.get("name").and_then(|n| n.as_str()).map(String::from);
                     if let Some(args) = p.get("arguments") {
                         let canonical = canonicalize_json(args);
-                        let raw_str = serde_json::to_string(args).unwrap_or_else(|_| canonical.clone());
+                        let raw_str =
+                            serde_json::to_string(args).unwrap_or_else(|_| canonical.clone());
                         tool_arguments_raw = Some(raw_str);
                         tool_arguments_canonical = Some(canonical);
                     } else {

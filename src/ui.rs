@@ -373,6 +373,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <h3>Transport Policy Rules</h3>
           <div style="margin-bottom:10px;">
             <label><input type="checkbox" id="policy-enabled-toggle" /> Enforce Policy Firewall (Fail-Closed)</label>
+            <div style="color:var(--muted); font-size:12px; margin-top:4px;">
+              Applies to <code>wb wrap</code> processes started after saving. Restart your MCP client to pick up a change in already-running wrappers.
+            </div>
           </div>
           <textarea id="policy-rules-editor" rows="10" style="width:100%; font-family:var(--font-mono);"></textarea>
           <div style="margin-top:8px;">

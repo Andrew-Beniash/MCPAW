@@ -42,11 +42,30 @@ enabled                = false
 fail_closed            = true
 block_on_schema_change = false
 
+# Rules are evaluated in order; the first match wins. The regex crate has no
+# lookaround, so "deny everything outside /workspace" is an allow rule followed
+# by a catch-all deny for the same tool. Arguments are matched as compact JSON,
+# so anchor on the key ("path":"...) rather than a bare substring, and deny
+# ".." first so /workspace/../etc/passwd cannot pass the allow rule.
 [[policy.rules]]
-id          = "deny-outside-workspace"
+id          = "deny-path-traversal"
 server      = "filesystem"
 tool        = "write_file"
-arg_pattern = "^(?!.*\"/workspace/).*"
+arg_pattern = "\\.\\.(/|\\\\|\")"
+effect      = "deny"
+reason      = "Path traversal ('..') is not allowed in filesystem writes"
+
+[[policy.rules]]
+id          = "allow-workspace-writes"
+server      = "filesystem"
+tool        = "write_file"
+arg_pattern = "\"path\":\"/workspace/"
+effect      = "allow"
+
+[[policy.rules]]
+id          = "deny-other-writes"
+server      = "filesystem"
+tool        = "write_file"
 effect      = "deny"
 reason      = "Filesystem writes outside /workspace are prohibited"
 

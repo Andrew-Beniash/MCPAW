@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 
+#[allow(clippy::large_enum_variant)]
 enum BusCommand {
     Event(WorkbenchEvent),
     Flush(oneshot::Sender<()>),

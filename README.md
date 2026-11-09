@@ -16,6 +16,8 @@
 4. **Fail-open observation, fail-closed policy**:
    - If the daemon (`wbd`) is down or crashes mid-run, `wb wrap` continues forwarding traffic between client and MCP server without interruption.
    - When the **Policy / Firewall** module is enabled (`fail_closed = true`), `wb wrap` blocks `tools/call` with an explicit JSON-RPC error if the daemon is unreachable or denies the call.
+   - If `wb.toml` cannot be loaded, `wb wrap` still starts the server and forwards traffic. If the file appears to enable the policy (`[policy] enabled = true`, `policy.enabled = true`, or an inline `policy = { enabled = true }`), `tools/call` is blocked with an error naming the config problem until it is fixed, unless a reachable `wbd` reports the policy as off. A broken config never silently disables the firewall.
+   - A JSON-RPC batch that contains a denied `tools/call` is rejected as a whole, with an array reply holding one error per request id.
 
 ---
 
@@ -194,11 +196,30 @@ max_identical_tool_calls = 5
 enabled     = false
 fail_closed = true
 
+# Rules are evaluated in order; the first match wins. The regex crate has no
+# lookaround, so "deny everything outside /workspace" is an allow rule followed
+# by a catch-all deny for the same tool. Arguments are matched as compact JSON,
+# so anchor on the key ("path":"...) rather than a bare substring, and deny
+# ".." first so /workspace/../etc/passwd cannot pass the allow rule.
 [[policy.rules]]
-id          = "deny-outside-workspace"
+id          = "deny-path-traversal"
 server      = "filesystem"
 tool        = "write_file"
-arg_pattern = "^(?!.*\"/workspace/).*"
+arg_pattern = "\\.\\.(/|\\\\|\")"
+effect      = "deny"
+reason      = "Path traversal ('..') is not allowed in filesystem writes"
+
+[[policy.rules]]
+id          = "allow-workspace-writes"
+server      = "filesystem"
+tool        = "write_file"
+arg_pattern = "\"path\":\"/workspace/"
+effect      = "allow"
+
+[[policy.rules]]
+id          = "deny-other-writes"
+server      = "filesystem"
+tool        = "write_file"
 effect      = "deny"
 reason      = "Filesystem writes outside /workspace are prohibited"
 
@@ -229,17 +250,26 @@ The test suite follows the priorities outlined in the Testing Approach:
 3. **Security Suite**: Verifies DNS-rebinding `403` blocks, cross-origin CSRF rejection, missing/invalid token `401` responses, non-loopback bind refusal, policy fail-closed behavior when `wbd` is killed, and the **Secret Canary** test ensuring `sk-canary-...` and `Bearer canary...` never appear in SQLite, WAL, blobs, or exports across any capture level.
 4. **Chaos Fixtures & Deterministic Fake LLM**: Tests `echo`, `slow`, `crashy`, `huge`, `chatty`, `liar` (schema-hash poisoning detector), `weird-schema`, and `dual` fixtures, plus scripted LLM loops and context bloat trajectories.
 
+5. **Review regression tests** (`tests/review_v2.rs`): invalid config with policy enabled fails closed, `wb.example.toml` loads and behaves as documented, blocked batches get array replies, failed policy saves leave live rules unchanged, saves preserve comments, and `--policy` is refused on non-Unix.
+
 Run the full test suite with:
 
 ```bash
 cargo test
 ```
 
+Report the added latency of `wb wrap` (also run by CI as a non-blocking job; budget is 2 ms p99):
+
+```bash
+cargo test --release --test review_v2 -- --ignored --nocapture bench_
+```
+
 ---
 
 ## Known Limitations (v0.1)
 
-- **Platform IPC**: Low-latency local IPC between `wb wrap` and `wbd` currently uses Unix domain sockets (`~/.local/share/workbench/wbd.sock`) and is supported on **macOS and Linux**. On non-Unix targets, `wb wrap` compiles and forwards stdio traffic in standalone pass-through mode.
+- **Platform IPC**: Low-latency local IPC between `wb wrap` and `wbd` currently uses Unix domain sockets (`~/.local/share/workbench/wbd.sock`) and is supported on **macOS and Linux**. On non-Unix targets, `wb wrap` compiles and forwards stdio traffic in standalone pass-through mode, and **policy enforcement is refused at startup** (`--policy` or `[policy] enabled = true` exits with an explicit error) rather than blocking every call. The Windows CI job is non-blocking until named-pipe IPC lands.
+- **Policy changes and running wrappers**: `wb wrap` decides whether to enforce policy when it starts. Turning the policy on in the UI applies to wrappers started afterwards; restart the MCP client to pick it up in servers that are already running. Rule edits themselves take effect immediately, because the daemon evaluates every check.
 - **Tokenizer Approximation**: When an LLM streaming response omits a final `usage` block (or when profiling per-message context segments in Context Window X-Ray), token counts are estimated using a fast UTF-8 character/word heuristic and explicitly badged with `~` (`cost_estimated = true`).
 - **OTLP Export**: Runs can be exported on demand via `wb export --format otlp` or `/api/export` and ingested via `/api/ingest/otel`; continuous background push to a remote OTLP collector endpoint (`export.otlp_endpoint`) is scheduled for v0.2.
 - **In-Memory SSE Observation Cap**: For arbitrarily long-running HTTP responses, in-memory payload buffering for observation is capped at 16 MB per request while raw network bytes continue streaming untouched to the client.

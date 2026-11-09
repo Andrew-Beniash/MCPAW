@@ -1,8 +1,6 @@
 use crate::config::{BreakerConfig, PolicyConfig, PolicyEffect, PolicyRule};
 use crate::mcp_parser::canonicalize_json;
-use crate::models::{
-    semconv, ContextBreakdown, PolicyDecision, SpanKind, Verdict, WorkbenchEvent,
-};
+use crate::models::{semconv, ContextBreakdown, PolicyDecision, SpanKind, Verdict, WorkbenchEvent};
 use crate::pricing::PriceTable;
 use anyhow::Result;
 use axum::Router;
@@ -27,7 +25,10 @@ pub trait Module: Send + Sync {
 
 /// Analyzes an OpenAI-compatible or Anthropic-compatible LLM request payload
 /// to produce a `ContextBreakdown` for the Context Window X-Ray module (F-11, UC-07).
-pub fn analyze_context_window(req_json: &Value, actual_input_tokens: Option<u64>) -> ContextBreakdown {
+pub fn analyze_context_window(
+    req_json: &Value,
+    actual_input_tokens: Option<u64>,
+) -> ContextBreakdown {
     let mut system_tokens = 0u64;
     let mut tools_tokens = 0u64;
     let mut user_tokens = 0u64;
@@ -78,8 +79,7 @@ pub fn analyze_context_window(req_json: &Value, actual_input_tokens: Option<u64>
                                 ) {
                                     tool_call_id_to_name.insert(id.to_string(), name.to_string());
                                 }
-                                assistant_tokens +=
-                                    PriceTable::estimate_tokens(&block.to_string());
+                                assistant_tokens += PriceTable::estimate_tokens(&block.to_string());
                             }
                             "tool_result" => {
                                 block_handled = true;
@@ -152,18 +152,15 @@ pub fn analyze_context_window(req_json: &Value, actual_input_tokens: Option<u64>
             tools_tokens = (tools_tokens as f64 * scale).round() as u64;
             user_tokens = (user_tokens as f64 * scale).round() as u64;
             assistant_tokens = (assistant_tokens as f64 * scale).round() as u64;
-            tool_results_tokens = actual.saturating_sub(
-                system_tokens + tools_tokens + user_tokens + assistant_tokens,
-            );
+            tool_results_tokens = actual
+                .saturating_sub(system_tokens + tools_tokens + user_tokens + assistant_tokens);
             for val in by_tool_result.values_mut() {
                 *val = (*val as f64 * scale).round() as u64;
             }
         }
     }
 
-    let total_tokens = actual_input_tokens
-        .filter(|&t| t > 0)
-        .unwrap_or(raw_sum);
+    let total_tokens = actual_input_tokens.filter(|&t| t > 0).unwrap_or(raw_sum);
 
     let mut bloat_warning = None;
     if total_tokens >= 100 {
@@ -331,7 +328,10 @@ impl Module for BreakerModule {
 
                 // Also update `"active-run"` bucket so unmarked MCP tool calls see the accumulated cost
                 if rkey != "active-run" {
-                    *self.run_cost_usd.entry("active-run".to_string()).or_insert(0.0) += mc.cost_usd;
+                    *self
+                        .run_cost_usd
+                        .entry("active-run".to_string())
+                        .or_insert(0.0) += mc.cost_usd;
                     *self.run_tokens.entry("active-run".to_string()).or_insert(0) +=
                         mc.input_tokens + mc.output_tokens;
                 }
@@ -551,7 +551,8 @@ impl Module for PolicyModule {
                     let key = (server_id.clone(), t.name.clone());
                     if let Some(prev) = self.seen_tool_hashes.get(&key) {
                         if prev != &t.schema_hash {
-                            self.changed_tools.insert(key.clone(), t.schema_hash.clone());
+                            self.changed_tools
+                                .insert(key.clone(), t.schema_hash.clone());
                         }
                     }
                     self.seen_tool_hashes.insert(key, t.schema_hash.clone());
@@ -581,13 +582,8 @@ impl Module for PolicyModule {
                             .get(semconv::GEN_AI_TOOL_CALL_ARGUMENTS)
                             .and_then(|v| v.as_str())
                             .unwrap_or("{}");
-                        let (verdict, _) = self.evaluate_call(
-                            &span.id,
-                            server_id,
-                            tool_name,
-                            args,
-                            span.start_ns,
-                        );
+                        let (verdict, _) =
+                            self.evaluate_call(&span.id, server_id, tool_name, args, span.start_ns);
                         return verdict;
                     }
                 }
